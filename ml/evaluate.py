@@ -22,6 +22,11 @@ from ml.dataset import (
     load_gold,
     time_based_split,
 )
+from ml.logging_utils import (
+    plot_per_horizon_error,
+    plot_predictions_vs_actual,
+    write_per_horizon_csv,
+)
 from ml.models.lstm import WeatherLSTM
 
 
@@ -92,13 +97,15 @@ def main() -> None:
     print(f"  RMSE = {_rmse(pred, true):6.3f} °C")
     print(f"  MAPE = {_mape(pred, true):6.2f} %")
 
+    horizons = list(range(1, spec.seq_out + 1))
+    per_h_mae = [_mae(pred[:, h], true[:, h]) for h in range(spec.seq_out)]
+    per_h_rmse = [_rmse(pred[:, h], true[:, h]) for h in range(spec.seq_out)]
+    per_h_mape = [_mape(pred[:, h], true[:, h]) for h in range(spec.seq_out)]
+
     print("\nPer-horizon (hours ahead):")
     print("  h+  MAE  RMSE  MAPE%")
-    for h in range(spec.seq_out):
-        mae = _mae(pred[:, h], true[:, h])
-        rmse = _rmse(pred[:, h], true[:, h])
-        mape = _mape(pred[:, h], true[:, h])
-        print(f"  {h + 1:>2d}  {mae:5.2f} {rmse:5.2f} {mape:5.1f}")
+    for h, m, r, p in zip(horizons, per_h_mae, per_h_rmse, per_h_mape):
+        print(f"  {h:>2d}  {m:5.2f} {r:5.2f} {p:5.1f}")
 
     # Persistence baseline: "next L_out values = last observed value".
     # Xva is the *un-normalized* raw window array (normalization happens
@@ -108,11 +115,24 @@ def main() -> None:
     target_idx = feature_cols.index("temperature_2m")
     last_obs = Xva[:, -1, target_idx]
     persistence = np.broadcast_to(last_obs[:, None], yva.shape)
+    persistence_mae = _mae(persistence, yva)
     print("\nPersistence baseline (last-observed-value):")
-    print(f"  MAE  = {_mae(persistence, yva):6.3f} °C")
+    print(f"  MAE  = {persistence_mae:6.3f} °C")
     print(f"  RMSE = {_rmse(persistence, yva):6.3f} °C")
 
-    Path(args.checkpoint).parent.mkdir(parents=True, exist_ok=True)
+    out_dir = Path(args.checkpoint).parent
+    out_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = out_dir / "per_horizon_metrics.csv"
+    horizon_plot = out_dir / "per_horizon_error.png"
+    preds_plot = out_dir / "predictions_vs_actual.png"
+    write_per_horizon_csv(csv_path, horizons, per_h_mae, per_h_rmse, per_h_mape)
+    plot_per_horizon_error(
+        horizons, per_h_mae, per_h_rmse, persistence_mae, horizon_plot
+    )
+    plot_predictions_vs_actual(pred, true, preds_plot, n_samples=6)
+    print(f"\n[eval] per-horizon CSV : {csv_path}")
+    print(f"[eval] per-horizon plot: {horizon_plot}")
+    print(f"[eval] preds-vs-actual : {preds_plot}")
 
 
 if __name__ == "__main__":

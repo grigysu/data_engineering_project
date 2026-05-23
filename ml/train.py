@@ -30,6 +30,7 @@ from ml.dataset import (
     load_gold,
     time_based_split,
 )
+from ml.logging_utils import EpochRecord, plot_loss_curves, write_training_log
 from ml.models.lstm import WeatherLSTM
 
 
@@ -131,12 +132,13 @@ def main() -> None:
     ckpt_path = Path(args.checkpoint)
     ckpt_path.parent.mkdir(parents=True, exist_ok=True)
     best_val = float("inf")
+    records: list[EpochRecord] = []
     print("[train] epoch  train_mse  val_mse")
     for epoch in range(1, args.epochs + 1):
         tr_loss = train_epoch(model, train_loader, loss_fn, optimizer, device)
         va_loss = eval_epoch(model, val_loader, loss_fn, device)
-        marker = ""
-        if va_loss < best_val:
+        is_best = va_loss < best_val
+        if is_best:
             best_val = va_loss
             torch.save(
                 {
@@ -152,7 +154,12 @@ def main() -> None:
                 },
                 ckpt_path,
             )
-            marker = "  <- best"
+        records.append(
+            EpochRecord(
+                epoch=epoch, train_mse=tr_loss, val_mse=va_loss, is_best=is_best
+            )
+        )
+        marker = "  <- best" if is_best else ""
         print(f"[train] {epoch:>5d}  {tr_loss:9.4f}  {va_loss:7.4f}{marker}")
 
     print(f"[train] best val MSE: {best_val:.4f}")
@@ -162,6 +169,13 @@ def main() -> None:
     metrics_path = ckpt_path.with_suffix(".metrics.json")
     metrics_path.write_text(json.dumps(metrics, indent=2))
     print(f"[train] metrics saved to {metrics_path}")
+
+    log_path = ckpt_path.parent / "training_log.csv"
+    plot_path = ckpt_path.parent / "loss_curves.png"
+    write_training_log(log_path, records)
+    plot_loss_curves(records, plot_path)
+    print(f"[train] training log saved to {log_path}")
+    print(f"[train] loss curves saved to {plot_path}")
 
 
 if __name__ == "__main__":
