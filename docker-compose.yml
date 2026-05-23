@@ -1,5 +1,6 @@
-# Phase 1 services: MinIO (object store) + Postgres (warehouse).
-# Spark, Hive Metastore, and Airflow are added in later phases.
+# Phase 1: MinIO (object store) + Postgres (warehouse backing).
+# Phase 2: Spark master + worker for the medallion ETL.
+# Hive Metastore and Airflow are added in later phases.
 
 services:
   minio:
@@ -55,6 +56,63 @@ services:
       timeout: 5s
       retries: 5
 
+  # One-shot: fix ownership on the named volume so the spark user (UID 185)
+  # can write Ivy's downloaded JARs. Named volumes default to root:root on
+  # first creation; without this, spark-submit --packages fails with
+  # FileNotFoundException in /home/spark/.ivy2/cache.
+  spark_init:
+    image: apache/spark:3.5.6
+    container_name: weather_spark_init
+    user: root
+    command: ["chown", "-R", "spark:spark", "/home/spark/.ivy2"]
+    volumes:
+      - spark_ivy:/home/spark/.ivy2
+
+  spark-master:
+    image: apache/spark:3.5.6
+    container_name: weather_spark_master
+    command:
+      - /opt/spark/bin/spark-class
+      - org.apache.spark.deploy.master.Master
+      - --host
+      - spark-master
+    environment:
+      SPARK_NO_DAEMONIZE: "true"
+    ports:
+      - "8080:8080"   # Master Web UI
+      - "7077:7077"   # Master RPC
+      - "4040:4040"   # Application UI (when a job is running)
+    volumes:
+      - ./spark_jobs:/opt/jobs:ro
+      - ./docker/spark/conf:/opt/spark/conf:ro
+      - spark_ivy:/home/spark/.ivy2   # cache downloaded jars between runs (chowned by spark_init)
+    depends_on:
+      minio:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      spark_init:
+        condition: service_completed_successfully
+
+  spark-worker:
+    image: apache/spark:3.5.6
+    container_name: weather_spark_worker
+    command:
+      - /opt/spark/bin/spark-class
+      - org.apache.spark.deploy.worker.Worker
+      - spark://spark-master:7077
+    environment:
+      SPARK_NO_DAEMONIZE: "true"
+      SPARK_WORKER_MEMORY: 2g
+      SPARK_WORKER_CORES: "2"
+    volumes:
+      - ./spark_jobs:/opt/jobs:ro
+      - ./docker/spark/conf:/opt/spark/conf:ro
+      - spark_ivy:/home/spark/.ivy2
+    depends_on:
+      - spark-master
+
 volumes:
   minio_data:
   postgres_data:
+  spark_ivy:
