@@ -24,6 +24,7 @@ from typing import Iterable
 from dotenv import load_dotenv
 
 from ingestion.grid import GridPoint, default_grid
+from ingestion.healthcheck import OK, check_openmeteo, render_text
 from ingestion.openmeteo_client import OpenMeteoClient
 from ingestion.schemas import OpenMeteoResponse
 from ingestion.storage import BronzeStorage, storage_from_env
@@ -69,7 +70,9 @@ def _parse_window(spec: str) -> tuple[date, date]:
         s, e = spec.split(":")
         return date.fromisoformat(s), date.fromisoformat(e)
     except ValueError as exc:
-        raise SystemExit(f"--backfill must be YYYY-MM-DD:YYYY-MM-DD (got {spec!r})") from exc
+        raise SystemExit(
+            f"--backfill must be YYYY-MM-DD:YYYY-MM-DD (got {spec!r})"
+        ) from exc
 
 
 async def _ingest_one_archive(
@@ -87,7 +90,9 @@ async def _ingest_one_archive(
                 point.lat, point.lon, start, end
             )
         except Exception as exc:
-            print(f"  ✗ archive {point.cell_id} {start}..{end}: {exc}", file=sys.stderr)
+            print(
+                f"  !! archive {point.cell_id} {start}..{end}: {exc}", file=sys.stderr
+            )
             return False, 0
         key = _archive_key(region, start.year, point)
         storage.write_json(key, response.model_dump(mode="json"))
@@ -107,7 +112,7 @@ async def _ingest_one_forecast(
         try:
             response = await client.fetch_forecast(point.lat, point.lon, forecast_days)
         except Exception as exc:
-            print(f"  ✗ forecast {point.cell_id}: {exc}", file=sys.stderr)
+            print(f"  !! forecast {point.cell_id}: {exc}", file=sys.stderr)
             return False, 0
         key = _forecast_key(region, run_ts, point)
         storage.write_json(key, response.model_dump(mode="json"))
@@ -129,8 +134,10 @@ async def run_backfill(
         for p in grid
         for cs, ce in _year_chunks(start, end)
     ]
-    print(f"Backfilling {len(grid)} points × {sum(1 for _ in _year_chunks(start, end))} years "
-          f"= {len(tasks)} requests (concurrency={concurrency})")
+    print(
+        f"Backfilling {len(grid)} points × {sum(1 for _ in _year_chunks(start, end))} years "
+        f"= {len(tasks)} requests (concurrency={concurrency})"
+    )
     results = await asyncio.gather(*tasks)
     succeeded = sum(1 for ok, _ in results if ok)
     rows = sum(n for ok, n in results if ok)
@@ -156,7 +163,9 @@ async def run_forecast(
         _ingest_one_forecast(client, storage, sem, region, run_ts, p, forecast_days)
         for p in grid
     ]
-    print(f"Forecasting {len(grid)} points × {forecast_days}d (concurrency={concurrency})")
+    print(
+        f"Forecasting {len(grid)} points × {forecast_days}d (concurrency={concurrency})"
+    )
     results = await asyncio.gather(*tasks)
     succeeded = sum(1 for ok, _ in results if ok)
     rows = sum(n for ok, n in results if ok)
@@ -166,6 +175,27 @@ async def run_forecast(
         failed=len(tasks) - succeeded,
         rows=rows,
     )
+
+
+async def _preflight(required: list[str], skip: bool) -> bool:
+    """Probe Open-Meteo before doing real work. Returns True if safe to proceed."""
+    if skip:
+        print("(skipping preflight healthcheck, --skip-check set)")
+        return True
+    print("Preflight: probing Open-Meteo endpoints...")
+    results = await check_openmeteo()
+    print(render_text(results))
+    by_name = {h.name: h for h in results}
+    bad = [n for n in required if by_name[n].verdict != OK]
+    if bad:
+        print(
+            f"\nAborting: required endpoint(s) not OK: {', '.join(bad)}. "
+            f"Pass --skip-check to override.",
+            file=sys.stderr,
+        )
+        return False
+    print()
+    return True
 
 
 async def main_async(args: argparse.Namespace) -> None:
@@ -181,7 +211,17 @@ async def main_async(args: argparse.Namespace) -> None:
         ),
     )
 
-    print(f"Region: {region}  |  Grid: {len(grid)} points  |  Storage: {storage.describe()}")
+    required: list[str] = []
+    if args.backfill:
+        required.append("archive")
+    if args.forecast:
+        required.append("forecast")
+    if required and not await _preflight(required, args.skip_check):
+        sys.exit(2)
+
+    print(
+        f"Region: {region}  |  Grid: {len(grid)} points  |  Storage: {storage.describe()}"
+    )
 
     async with client:
         if args.backfill:
@@ -202,7 +242,9 @@ async def main_async(args: argparse.Namespace) -> None:
                 f"({stats.failed} failed), {stats.rows:,} hourly rows."
             )
         if not args.backfill and not args.forecast:
-            print("Nothing to do. Pass --backfill YYYY-MM-DD:YYYY-MM-DD and/or --forecast.")
+            print(
+                "Nothing to do. Pass --backfill YYYY-MM-DD:YYYY-MM-DD and/or --forecast."
+            )
 
 
 def main() -> None:
@@ -228,6 +270,11 @@ def main() -> None:
         type=int,
         default=int(os.getenv("INGEST_CONCURRENCY", "5")),
         help="Max in-flight HTTP requests. Default: 5.",
+    )
+    parser.add_argument(
+        "--skip-check",
+        action="store_true",
+        help="Skip the preflight Open-Meteo healthcheck.",
     )
     asyncio.run(main_async(parser.parse_args()))
 

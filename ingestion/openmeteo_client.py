@@ -93,6 +93,6 @@ class OpenMeteoClient:
                         raise
                 if attempt == self.max_retries:
                     break
-                await asyncio.sleep(2 ** attempt)
+                await asyncio.sleep(2**attempt)
         assert last_exc is not None
         raise last_exc

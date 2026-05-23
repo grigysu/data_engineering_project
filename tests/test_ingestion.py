@@ -6,7 +6,6 @@ import json
 from datetime import date
 from pathlib import Path
 
-import pytest
 
 from ingestion.grid import ARMENIA, BoundingBox, make_grid
 from ingestion.run_ingest import _archive_key, _year_chunks
@@ -48,7 +47,10 @@ def test_archive_key_layout():
     from ingestion.grid import GridPoint
 
     key = _archive_key("armenia", 2024, GridPoint(lat=40.0700, lon=44.5000))
-    assert key == "bronze/region=armenia/dataset=archive/year=2024/lat=40.0700_lon=44.5000.json"
+    assert (
+        key
+        == "bronze/region=armenia/dataset=archive/year=2024/lat=40.0700_lon=44.5000.json"
+    )
 
 
 def _fake_response(n_hours: int = 3) -> dict:
