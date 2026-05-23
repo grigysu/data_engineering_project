@@ -1,0 +1,39 @@
+<?xml version="1.0"?>
+<!--
+  Mounted into the hive-metastore container at /opt/hadoop/etc/hadoop/core-site.xml.
+  Hadoop reads S3A config from XML (not JVM system properties), so without
+  this the metastore fails with NoAuthWithAWSException when CREATE TABLE
+  validates an s3a:// LOCATION.
+
+  Same values as Spark's spark-defaults.conf — kept in sync by hand for now.
+-->
+<configuration>
+  <property>
+    <name>fs.s3a.endpoint</name>
+    <value>http://minio:9000</value>
+  </property>
+  <property>
+    <name>fs.s3a.access.key</name>
+    <value>minioadmin</value>
+  </property>
+  <property>
+    <name>fs.s3a.secret.key</name>
+    <value>minioadmin</value>
+  </property>
+  <property>
+    <name>fs.s3a.path.style.access</name>
+    <value>true</value>
+  </property>
+  <property>
+    <name>fs.s3a.connection.ssl.enabled</name>
+    <value>false</value>
+  </property>
+  <property>
+    <name>fs.s3a.aws.credentials.provider</name>
+    <value>org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider</value>
+  </property>
+  <property>
+    <name>fs.s3a.impl</name>
+    <value>org.apache.hadoop.fs.s3a.S3AFileSystem</value>
+  </property>
+</configuration>

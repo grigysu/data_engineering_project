@@ -56,6 +56,60 @@ services:
       timeout: 5s
       retries: 5
 
+  # One-shot: initialize the Hive Metastore schema in metastore_db. Idempotent
+  # check via `schematool -info` first — only initializes if the schema is
+  # missing. Hive auto-downloads the postgres JDBC driver when DB_DRIVER=postgres.
+  hive_init:
+    image: apache/hive:4.0.0
+    container_name: weather_hive_init
+    environment:
+      SERVICE_NAME: schematool
+      DB_DRIVER: postgres
+      SCHEMA_COMMAND: initOrUpgrade
+      HADOOP_OPTIONAL_TOOLS: hadoop-aws
+      SERVICE_OPTS: >-
+        -Djavax.jdo.option.ConnectionDriverName=org.postgresql.Driver
+        -Djavax.jdo.option.ConnectionURL=jdbc:postgresql://postgres:5432/metastore_db
+        -Djavax.jdo.option.ConnectionUserName=hive
+        -Djavax.jdo.option.ConnectionPassword=hive
+    volumes:
+      - ./docker/hive/jdbc/postgresql-42.7.3.jar:/opt/hive/lib/postgresql-42.7.3.jar:ro
+      - ./docker/hive/conf/core-site.xml:/opt/hadoop/etc/hadoop/core-site.xml:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  hive-metastore:
+    image: apache/hive:4.0.0
+    container_name: weather_hive_metastore
+    environment:
+      SERVICE_NAME: metastore
+      DB_DRIVER: postgres
+      # Puts /opt/hadoop/share/hadoop/tools/lib/* on the classpath so the
+      # metastore can resolve s3a:// LOCATION paths (S3AFileSystem class).
+      HADOOP_OPTIONAL_TOOLS: hadoop-aws
+      # JVM options: JDBC for the metastore backend + S3A config so the
+      # metastore can validate/list s3a:// LOCATION URIs against MinIO.
+      SERVICE_OPTS: >-
+        -Djavax.jdo.option.ConnectionDriverName=org.postgresql.Driver
+        -Djavax.jdo.option.ConnectionURL=jdbc:postgresql://postgres:5432/metastore_db
+        -Djavax.jdo.option.ConnectionUserName=hive
+        -Djavax.jdo.option.ConnectionPassword=hive
+        -Dfs.s3a.endpoint=http://minio:9000
+        -Dfs.s3a.access.key=minioadmin
+        -Dfs.s3a.secret.key=minioadmin
+        -Dfs.s3a.path.style.access=true
+        -Dfs.s3a.connection.ssl.enabled=false
+        -Dfs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem
+    ports:
+      - "9083:9083"   # Thrift metastore (for external BI / debug tools)
+    volumes:
+      - ./docker/hive/jdbc/postgresql-42.7.3.jar:/opt/hive/lib/postgresql-42.7.3.jar:ro
+      - ./docker/hive/conf/core-site.xml:/opt/hadoop/etc/hadoop/core-site.xml:ro
+    depends_on:
+      hive_init:
+        condition: service_completed_successfully
+
   # One-shot: fix ownership on the named volume so the spark user (UID 185)
   # can write Ivy's downloaded JARs. Named volumes default to root:root on
   # first creation; without this, spark-submit --packages fails with
@@ -93,6 +147,8 @@ services:
         condition: service_healthy
       spark_init:
         condition: service_completed_successfully
+      hive-metastore:
+        condition: service_started
 
   spark-worker:
     image: apache/spark:3.5.6
