@@ -1,0 +1,60 @@
+# Phase 1 services: MinIO (object store) + Postgres (warehouse).
+# Spark, Hive Metastore, and Airflow are added in later phases.
+
+services:
+  minio:
+    image: minio/minio:latest
+    container_name: weather_minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # Web console
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # One-shot job that creates the bucket on first start.
+  minio_init:
+    image: minio/mc:latest
+    container_name: weather_minio_init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+        mc alias set local http://minio:9000 ${MINIO_ROOT_USER:-minioadmin} ${MINIO_ROOT_PASSWORD:-minioadmin} &&
+        mc mb --ignore-existing local/${MINIO_BUCKET:-weather-lake} &&
+        mc mb --ignore-existing local/${MINIO_BUCKET:-weather-lake}/bronze &&
+        mc mb --ignore-existing local/${MINIO_BUCKET:-weather-lake}/silver &&
+        mc mb --ignore-existing local/${MINIO_BUCKET:-weather-lake}/gold &&
+        echo 'MinIO bucket layout ready.'
+      "
+
+  postgres:
+    image: postgres:16
+    container_name: weather_postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-weather}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-weather}
+      POSTGRES_DB: ${POSTGRES_DB:-weather_dw}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./docker/postgres-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-weather} -d ${POSTGRES_DB:-weather_dw}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  minio_data:
+  postgres_data:

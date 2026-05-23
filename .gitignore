@@ -1,0 +1,33 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+env/
+venv/
+build/
+dist/
+*.egg-info/
+
+# Secrets / local config
+.env
+
+# Local dev data (before MinIO is wired up)
+data/
+*.parquet
+
+# ML artifacts
+checkpoints/
+mlruns/
+
+# Test / lint caches
+.pytest_cache/
+.ruff_cache/
+.coverage
+
+# IDE
+.idea/
+.vscode/
+
+# Claude Code state
+.claude/
