@@ -1,9 +1,8 @@
 """PyTorch Dataset over the Gold parquet.
 
-Read the Spark-produced gold table from the local lake (MinIO via s3a is
-overkill for the train loop — for small models we just sync the parquet
-locally or read it via pyarrow), then window each per-location time
-series into (seq_in, seq_out) pairs.
+Read the Spark-produced gold table directly from MinIO via pyarrow's
+S3FileSystem (the local-FS shortcut was removed in Phase 2a), then window
+each per-location time series into (seq_in, seq_out) pairs.
 
 Time-based train/val split: windows are sorted by anchor timestamp, then
 sliced — no random shuffling that would leak the future into the past.
@@ -13,7 +12,6 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -56,34 +54,34 @@ class WindowSpec:
     stride: int = 1
 
 
-def load_gold(path: str | Path) -> pd.DataFrame:
-    """Read the gold parquet into a pandas DataFrame.
+def load_gold(path: str) -> pd.DataFrame:
+    """Read the gold parquet into a pandas DataFrame from MinIO.
 
-    Path can be:
-      - a local directory or .parquet file (anything pyarrow can open), or
-      - an s3://... URI; MinIO/S3 config comes from S3_ENDPOINT,
-        S3_ACCESS_KEY, S3_SECRET_KEY env vars (defaults match the local
-        MinIO from docker-compose).
+    `path` must be an `s3://bucket/prefix` URI. Connection settings come from
+    the S3_ENDPOINT, S3_ACCESS_KEY, S3_SECRET_KEY env vars (defaults match
+    the local MinIO from docker-compose).
     """
     path_str = str(path)
-    if path_str.startswith("s3://"):
-        endpoint = os.getenv("S3_ENDPOINT", "http://minio:9000")
-        scheme = "https" if endpoint.startswith("https://") else "http"
-        host_port = endpoint.split("://", 1)[1]
-        fs = pafs.S3FileSystem(
-            endpoint_override=host_port,
-            access_key=os.getenv("S3_ACCESS_KEY", "minioadmin"),
-            secret_key=os.getenv("S3_SECRET_KEY", "minioadmin"),
-            scheme=scheme,
+    if not path_str.startswith("s3://"):
+        raise ValueError(
+            f"--gold must be an s3:// URI; got {path_str!r}. "
+            "MinIO is the only supported backend (see docs/USAGE.md)."
         )
-        bucket_path = path_str[len("s3://") :]
-        df = (
-            pads.dataset(bucket_path, format="parquet", filesystem=fs)
-            .to_table()
-            .to_pandas()
-        )
-    else:
-        df = pads.dataset(path_str, format="parquet").to_table().to_pandas()
+    endpoint = os.getenv("S3_ENDPOINT", "http://minio:9000")
+    scheme = "https" if endpoint.startswith("https://") else "http"
+    host_port = endpoint.split("://", 1)[1]
+    fs = pafs.S3FileSystem(
+        endpoint_override=host_port,
+        access_key=os.getenv("S3_ACCESS_KEY", "minioadmin"),
+        secret_key=os.getenv("S3_SECRET_KEY", "minioadmin"),
+        scheme=scheme,
+    )
+    bucket_path = path_str[len("s3://") :]
+    df = (
+        pads.dataset(bucket_path, format="parquet", filesystem=fs)
+        .to_table()
+        .to_pandas()
+    )
     return df.sort_values(["lat", "lon", "observed_at"]).reset_index(drop=True)
 
 

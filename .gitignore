@@ -12,8 +12,7 @@ dist/
 # Secrets / local config
 .env
 
-# Local dev data (before MinIO is wired up)
-data/
+# Leftover local parquet (Phase 2a moved everything to MinIO; safe to delete `data/`)
 *.parquet
 
 # ML artifacts

@@ -1,24 +1,30 @@
 """End-to-end tests for the predictor + FastAPI serving layer.
 
-Builds a real Predictor against the actual on-disk checkpoint + gold
-parquet — if those don't exist, the tests skip cleanly. (CI / fresh
-clones would need to run Phase 2 + Phase 4 first; the project's full
-quality-gate run on a freshly cloned repo doesn't.)
+Builds a real Predictor against the actual on-disk checkpoint + MinIO-hosted
+gold parquet. Skipped by default; opt in with `RUN_SERVING_TESTS=1` once
+docker-compose is up and the LSTM has been trained at least once.
+
+(FastAPI is scheduled to be replaced by Streamlit in Phase 2c; this file
+will be retired then.)
 """
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
 
 CHECKPOINT = Path("checkpoints/best.pt")
-GOLD = Path("data/lake/gold/weather_features")
+GOLD = "s3://weather-lake/gold/weather_features"
 
 
 pytestmark = pytest.mark.skipif(
-    not (CHECKPOINT.exists() and GOLD.exists()),
-    reason="checkpoint or gold parquet missing — run ml.train + spark jobs first",
+    os.getenv("RUN_SERVING_TESTS") != "1" or not CHECKPOINT.exists(),
+    reason=(
+        "serving integration tests: set RUN_SERVING_TESTS=1 and ensure "
+        "checkpoints/best.pt exists + MinIO is reachable."
+    ),
 )
 
 

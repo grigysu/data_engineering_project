@@ -2,15 +2,12 @@
 
 from __future__ import annotations
 
-import json
 from datetime import date
-from pathlib import Path
 
 
 from ingestion.grid import ARMENIA, BoundingBox, make_grid
-from ingestion.run_ingest import _archive_key, _year_chunks
+from ingestion.run_ingest import _archive_key, _chunk_has_missing, _year_chunks
 from ingestion.schemas import HOURLY_VARIABLE_NAMES, OpenMeteoResponse
-from ingestion.storage import LocalBronzeStorage
 
 
 def test_grid_count_and_corners():
@@ -81,9 +78,15 @@ def test_schema_tolerates_nulls_in_hourly_arrays():
     assert parsed.hourly.temperature_2m == [None, 1.5]
 
 
-def test_local_storage_writes_json(tmp_path: Path):
-    storage = LocalBronzeStorage(tmp_path / "lake")
-    path = storage.write_json("bronze/foo/bar.json", {"a": 1, "b": [1, 2, 3]})
-    written = Path(path)
-    assert written.exists()
-    assert json.loads(written.read_text(encoding="utf-8")) == {"a": 1, "b": [1, 2, 3]}
+def test_chunk_has_missing_full_coverage():
+    present = {date(2026, 5, d) for d in range(1, 11)}
+    assert not _chunk_has_missing(date(2026, 5, 3), date(2026, 5, 7), present)
+
+
+def test_chunk_has_missing_partial_coverage():
+    present = {date(2026, 5, d) for d in (1, 2, 3, 6, 7)}
+    assert _chunk_has_missing(date(2026, 5, 1), date(2026, 5, 7), present)
+
+
+def test_chunk_has_missing_empty_coverage():
+    assert _chunk_has_missing(date(2026, 5, 1), date(2026, 5, 1), set())

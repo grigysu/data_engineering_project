@@ -1,14 +1,15 @@
 """CLI: ingest Open-Meteo data into the bronze layer.
 
 Examples:
-    # Backfill historical hourly data for the whole grid:
+    # Backfill historical hourly data for the whole grid (additive — skips
+    # year chunks whose dates are already in gold per the coverage manifest):
     python -m ingestion.run_ingest --backfill 2023-01-01:2024-12-31
+
+    # Force re-fetch even if the manifest says everything is present:
+    python -m ingestion.run_ingest --backfill 2024-01-01:2024-12-31 --force
 
     # Pull the latest 14-day forecast for every grid point:
     python -m ingestion.run_ingest --forecast --forecast-days 14
-
-    # Smoke test: just one year, lower concurrency:
-    python -m ingestion.run_ingest --backfill 2024-01-01:2024-12-31 --concurrency 3
 """
 
 from __future__ import annotations
@@ -23,6 +24,12 @@ from typing import Iterable
 
 from dotenv import load_dotenv
 
+from ingestion.coverage import (
+    Coverage,
+    daterange,
+    load_or_scan_coverage,
+    write_manifest,
+)
 from ingestion.grid import GridPoint, default_grid
 from ingestion.healthcheck import OK, check_openmeteo, render_text
 from ingestion.openmeteo_client import OpenMeteoClient
@@ -38,6 +45,7 @@ class IngestStats:
     succeeded: int = 0
     failed: int = 0
     rows: int = 0
+    skipped_chunks: int = 0
 
 
 def _archive_key(region: str, year: int, point: GridPoint) -> str:
@@ -73,6 +81,11 @@ def _parse_window(spec: str) -> tuple[date, date]:
         raise SystemExit(
             f"--backfill must be YYYY-MM-DD:YYYY-MM-DD (got {spec!r})"
         ) from exc
+
+
+def _chunk_has_missing(chunk_start: date, chunk_end: date, present: set[date]) -> bool:
+    """True if any date in [chunk_start, chunk_end] is absent from `present`."""
+    return any(d not in present for d in daterange(chunk_start, chunk_end))
 
 
 async def _ingest_one_archive(
@@ -127,16 +140,37 @@ async def run_backfill(
     start: date,
     end: date,
     concurrency: int,
+    coverage: Coverage | None,
+    force: bool,
 ) -> IngestStats:
+    """Additive backfill. Skips (cell × year) chunks fully covered in gold."""
+    present = coverage.archive if coverage else set()
     sem = asyncio.Semaphore(concurrency)
-    tasks = [
-        _ingest_one_archive(client, storage, sem, region, p, cs, ce)
-        for p in grid
-        for cs, ce in _year_chunks(start, end)
-    ]
+    tasks = []
+    skipped = 0
+    requested_dates = set(daterange(start, end))
+    missing = requested_dates - present
+    for p in grid:
+        for cs, ce in _year_chunks(start, end):
+            if not force and not _chunk_has_missing(cs, ce, present):
+                skipped += 1
+                continue
+            tasks.append(_ingest_one_archive(client, storage, sem, region, p, cs, ce))
+
+    if not tasks:
+        print(
+            f"Additive backfill: nothing to do — all {len(requested_dates)} requested "
+            f"dates already present in gold (skipped {skipped} cell×year chunks). "
+            "Pass --force to re-fetch."
+        )
+        return IngestStats(
+            requested=0, succeeded=0, failed=0, rows=0, skipped_chunks=skipped
+        )
+
     print(
-        f"Backfilling {len(grid)} points × {sum(1 for _ in _year_chunks(start, end))} years "
-        f"= {len(tasks)} requests (concurrency={concurrency})"
+        f"Additive backfill: {len(grid)} cells × ranges → {len(tasks)} requests "
+        f"({skipped} chunks skipped, {len(missing)}/{len(requested_dates)} requested "
+        f"dates not yet in gold, concurrency={concurrency})"
     )
     results = await asyncio.gather(*tasks)
     succeeded = sum(1 for ok, _ in results if ok)
@@ -146,6 +180,7 @@ async def run_backfill(
         succeeded=succeeded,
         failed=len(tasks) - succeeded,
         rows=rows,
+        skipped_chunks=skipped,
     )
 
 
@@ -202,6 +237,7 @@ async def main_async(args: argparse.Namespace) -> None:
     region = os.getenv("REGION_NAME", "armenia")
     grid = default_grid()
     storage = storage_from_env()
+    s3_client = storage.client
     client = OpenMeteoClient(
         archive_url=os.getenv(
             "OPENMETEO_BASE_URL", "https://archive-api.open-meteo.com/v1/archive"
@@ -223,16 +259,58 @@ async def main_async(args: argparse.Namespace) -> None:
         f"Region: {region}  |  Grid: {len(grid)} points  |  Storage: {storage.describe()}"
     )
 
+    coverage: Coverage | None = None
+    if args.backfill:
+        coverage = load_or_scan_coverage(s3_client, storage.bucket)
+        print(
+            f"Coverage manifest: {len(coverage.archive)} archive dates already "
+            f"ingested, {len(coverage.forecast)} forecast dates."
+        )
+
     async with client:
         if args.backfill:
             start, end = _parse_window(args.backfill)
             stats = await run_backfill(
-                client, storage, grid, region, start, end, args.concurrency
+                client,
+                storage,
+                grid,
+                region,
+                start,
+                end,
+                args.concurrency,
+                coverage=(None if args.force else coverage),
+                force=args.force,
             )
             print(
                 f"\nBackfill done: {stats.succeeded}/{stats.requested} files "
-                f"({stats.failed} failed), {stats.rows:,} hourly rows."
+                f"({stats.failed} failed, {stats.skipped_chunks} chunks skipped), "
+                f"{stats.rows:,} hourly rows."
             )
+            # Manifest reflects "dates we've successfully ingested". Update it
+            # only if there were no failures, so the next run will correctly
+            # retry partial backfills. If failures occurred, leave the manifest
+            # alone — re-running picks up exactly the missing chunks.
+            if (
+                coverage is not None
+                and stats.failed == 0
+                and (stats.succeeded > 0 or stats.skipped_chunks > 0)
+            ):
+                added = set(daterange(start, end)) - coverage.archive
+                coverage.archive.update(daterange(start, end))
+                coverage.scanned_at = datetime.now(timezone.utc)
+                try:
+                    write_manifest(s3_client, storage.bucket, coverage)
+                    print(
+                        f"Coverage manifest updated: +{len(added)} new dates "
+                        f"(total {len(coverage.archive)} archive dates)."
+                    )
+                except Exception as exc:
+                    print(f"  (warn) couldn't update manifest: {exc}", file=sys.stderr)
+            elif stats.failed > 0:
+                print(
+                    "  (note) manifest not updated due to failures — re-run to "
+                    "retry the missing chunks."
+                )
         if args.forecast:
             stats = await run_forecast(
                 client, storage, grid, region, args.forecast_days, args.concurrency
@@ -252,7 +330,8 @@ def main() -> None:
     parser.add_argument(
         "--backfill",
         metavar="START:END",
-        help="Backfill historical hourly archive for this date range.",
+        help="Backfill historical hourly archive for this date range. Additive: "
+        "skips year chunks already represented in the gold coverage manifest.",
     )
     parser.add_argument(
         "--forecast",
@@ -275,6 +354,12 @@ def main() -> None:
         "--skip-check",
         action="store_true",
         help="Skip the preflight Open-Meteo healthcheck.",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-fetch every cell × year chunk in --backfill, ignoring the gold "
+        "coverage manifest.",
     )
     asyncio.run(main_async(parser.parse_args()))
 

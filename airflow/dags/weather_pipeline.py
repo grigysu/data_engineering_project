@@ -1,16 +1,22 @@
 """End-to-end weather pipeline DAG.
 
-Runs the full chain we've been triggering by hand:
+Runs the full chain:
 
-    ingest_forecast → bronze_to_silver → silver_to_gold
-                                            → load_warehouse
-                                            → train_model
+    ingest_archive → bronze_to_silver → silver_to_gold
+                                          → load_warehouse
+                                          → train_model
 
-Ingestion + training run inside the Airflow container itself (which has
-our project code mounted at /opt/weather and the runtime deps installed
-via the custom image). Spark jobs run via `docker exec` into the
-spark-master container — Airflow can do this because the host docker
-socket is bind-mounted in.
+Daily run: additively ingests the last 30 days of *archive* (real observations)
+from Open-Meteo, then re-builds silver/gold/warehouse and retrains.
+
+Manual trigger: pass `conf={"start_date": "...", "end_date": "...", "force": false}`
+to backfill a custom range. The Streamlit dashboard (Phase 2c) calls this DAG
+via the Airflow REST API with custom conf.
+
+Phase 2a: switched from `--forecast` (Open-Meteo's own model output) to
+`--backfill` against the archive endpoint — bronze now means real observations.
+Ingest is additive (gold-coverage manifest), so daily runs are cheap once the
+backfill has caught up.
 
 Run/inspect from http://localhost:8081 (admin/admin).
 """
@@ -20,15 +26,16 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 
 from airflow import DAG
+from airflow.models.param import Param
 from airflow.operators.bash import BashOperator
 
 
 PROJECT_DIR = "/opt/weather"
 
-# S3/MinIO env vars exposed to the Python tasks so they can write to
-# bronze and read gold straight from MinIO without a local mirror step.
+# MinIO + S3 client env vars exposed to the Python tasks so they can write to
+# bronze and read gold straight from MinIO without a local mirror step. The
+# STORAGE_BACKEND var was dropped in Phase 2a (MinIO is the only backend).
 S3_ENV = (
-    "STORAGE_BACKEND=s3 "
     "MINIO_BUCKET=weather-lake "
     "MINIO_ENDPOINT=http://minio:9000 "
     "MINIO_ROOT_USER=minioadmin "
@@ -59,47 +66,73 @@ default_args = {
 
 with DAG(
     dag_id="weather_pipeline",
-    description="Ingest Open-Meteo → bronze/silver/gold on MinIO → Postgres warehouse → LSTM training.",
+    description=(
+        "Ingest Open-Meteo archive (additive) → bronze/silver/gold on MinIO → "
+        "Postgres warehouse → LSTM training."
+    ),
     default_args=default_args,
     start_date=datetime(2026, 5, 1),
     schedule="@daily",
     catchup=False,
     max_active_runs=1,
+    params={
+        # Default daily window: archive lags ~2 days, so pull yesterday-2d back
+        # 30 days. Jinja-rendered at run time from the DagRun's logical date.
+        "start_date": Param(
+            "",
+            type="string",
+            description=(
+                "Backfill start date YYYY-MM-DD. Empty = (logical_date - 32d)."
+            ),
+        ),
+        "end_date": Param(
+            "",
+            type="string",
+            description=("Backfill end date YYYY-MM-DD. Empty = (logical_date - 2d)."),
+        ),
+        "force": Param(
+            False,
+            type="boolean",
+            description="Re-fetch every chunk even if the manifest says it's covered.",
+        ),
+    },
     tags=["weather", "end-to-end"],
 ) as dag:
-    # Phase 1: pull the latest 7-day forecast for every grid point.
-    # --skip-check because the preflight healthcheck assumes we always need
-    # archive too; here we only use forecast.
-    ingest_forecast = BashOperator(
-        task_id="ingest_forecast",
+    # Additive ingest of the archive endpoint. Empty start/end → defaults
+    # computed at render time from `ds` (DAG logical date).
+    ingest_archive = BashOperator(
+        task_id="ingest_archive",
         bash_command=(
+            'START="{{ params.start_date or macros.ds_add(ds, -32) }}"; '
+            'END="{{ params.end_date or macros.ds_add(ds, -2) }}"; '
+            'FORCE_FLAG="{{ "--force" if params.force else "" }}"; '
             f"cd {PROJECT_DIR} && "
             f"{S3_ENV} python -m ingestion.run_ingest "
-            "--forecast --forecast-days 7 --concurrency 5 --skip-check"
+            '--backfill "$START:$END" $FORCE_FLAG '
+            "--concurrency 5 --skip-check"
         ),
     )
 
-    # Phase 2a: JSON → Parquet, explode hourly arrays, partition by (dataset, date).
+    # JSON → Parquet, explode hourly arrays, partition by (dataset, date).
     bronze_to_silver = BashOperator(
         task_id="bronze_to_silver",
         bash_command=f"{SPARK_SUBMIT} /opt/jobs/bronze_to_silver.py",
     )
 
-    # Phase 2a: time + lag + rolling features.
+    # Time + lag + rolling features.
     silver_to_gold = BashOperator(
         task_id="silver_to_gold",
         bash_command=f"{SPARK_SUBMIT} /opt/jobs/silver_to_gold.py",
     )
 
-    # Phase 3: TRUNCATE + INSERT into fact + dims via JDBC.
+    # TRUNCATE + INSERT into fact + dims via JDBC.
     load_warehouse = BashOperator(
         task_id="load_warehouse",
         bash_command=f"{SPARK_SUBMIT} /opt/jobs/load_to_warehouse.py",
     )
 
-    # Phase 4: retrain the LSTM against the freshly-rebuilt gold table.
-    # Reads gold straight from MinIO via the s3:// path support added to
-    # ml.dataset.load_gold; checkpoints land in /opt/weather/checkpoints.
+    # Retrain the LSTM against the freshly-rebuilt gold table.
+    # Reads gold straight from MinIO via the s3:// path support in ml.dataset.
     train_model = BashOperator(
         task_id="train_model",
         bash_command=(
@@ -111,5 +144,5 @@ with DAG(
         ),
     )
 
-    ingest_forecast >> bronze_to_silver >> silver_to_gold
+    ingest_archive >> bronze_to_silver >> silver_to_gold
     silver_to_gold >> [load_warehouse, train_model]

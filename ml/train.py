@@ -1,11 +1,11 @@
 """Train a multivariate LSTM on the windowed gold dataset.
 
 Usage:
-    python -m ml.train --gold ./data/lake/gold/weather_features
+    python -m ml.train --gold s3://weather-lake/gold/weather_features
 
-Reads gold parquet from a local path (use `mc cp --recursive
-local/weather-lake/gold/ ./data/lake/gold/` to sync from MinIO first,
-or point at any pyarrow-readable path).
+Reads gold parquet directly from MinIO via pyarrow's S3FileSystem (Phase
+2a dropped the local-FS path). Set S3_ENDPOINT / S3_ACCESS_KEY /
+S3_SECRET_KEY in `.env` to point at your MinIO instance.
 
 Train/val split is time-based (no leakage). Checkpoints the model with
 the lowest validation loss to `checkpoints/best.pt`.
