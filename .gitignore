@@ -31,3 +31,6 @@ mlruns/
 
 # Claude Code state
 .claude/
+
+# Airflow runtime artifacts (logs, scheduler state)
+airflow/logs/
