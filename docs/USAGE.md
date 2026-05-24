@@ -10,7 +10,7 @@ Every command you need to run the project, organised by workflow. PowerShell syn
 - [Workflow 2 — run the Spark ETL chain](#workflow-2--run-the-spark-etl-chain)
 - [Workflow 3 — query the lake / warehouse](#workflow-3--query-the-lake--warehouse)
 - [Workflow 4 — train + evaluate the model](#workflow-4--train--evaluate-the-model)
-- [Workflow 5 — serve forecasts over HTTP](#workflow-5--serve-forecasts-over-http)
+- [Workflow 5 — drive the pipeline from the Streamlit dashboard](#workflow-5--drive-the-pipeline-from-the-streamlit-dashboard)
 - [Workflow 6 — orchestrate everything via Airflow](#workflow-6--orchestrate-everything-via-airflow)
 - [Run quality gates before committing](#run-quality-gates-before-committing)
 - [Troubleshooting](#troubleshooting)
@@ -48,7 +48,7 @@ docker cp warehouse/hive/create_external_tables.sql weather_spark_master:/tmp/
 docker exec weather_spark_master /opt/spark/bin/spark-sql `
   --master spark://spark-master:7077 -f /tmp/create_external_tables.sql
 
-# Postgres warehouse: create the star schema
+# Postgres warehouse: create the star schema + (Phase 2b) predictions + models tables
 Get-ChildItem warehouse/ddl/*.sql | Sort-Object Name | ForEach-Object {
     Get-Content $_.FullName -Raw | docker exec -i weather_postgres `
         psql -U weather -d weather_dw -v ON_ERROR_STOP=1
@@ -89,36 +89,37 @@ python -m ingestion.healthcheck --require forecast     # only forecast must be O
 
 Exit code: `0` if all required endpoints OK, `1` otherwise.
 
-### Pull the 7-day forecast for every grid point
+> **Phase 2a note**: MinIO is now the only storage backend. There is no `STORAGE_BACKEND` switch and no local `data/` folder. Make sure `docker compose up -d` is running before ingestion.
+
+### Backfill historical archive (additive)
 
 ```powershell
-python -m ingestion.run_ingest --forecast --forecast-days 7
+python -m ingestion.run_ingest --backfill 2026-05-01:2026-05-24
 ```
 
-Uses `STORAGE_BACKEND` from `.env` (default `local` → `./data/lake/bronze/...`). For MinIO:
+This is **additive**: a gold-coverage manifest at `s3://weather-lake/manifest/ingested.json` records which dates have already been ingested, so re-running the same range is a no-op and extending it only fetches the gap. 100 grid points × N years = N×100 API calls, chunked by year per point.
 
 ```powershell
-$env:STORAGE_BACKEND='s3'
-python -m ingestion.run_ingest --forecast --forecast-days 7
+# Force re-fetch even for already-covered chunks:
+python -m ingestion.run_ingest --backfill 2026-05-01:2026-05-24 --force
 ```
 
-### Backfill historical data (when the archive endpoint recovers)
+### Pull the latest 14-day forecast for every grid point
 
 ```powershell
-python -m ingestion.run_ingest --backfill 2023-01-01:2025-12-31 --concurrency 8
+python -m ingestion.run_ingest --forecast --forecast-days 14
 ```
-
-100 grid points × 3 years = 300 API calls; chunked by year per point. The preflight will refuse if archive endpoint isn't OK — pass `--skip-check` to override.
 
 ### CLI flags reference
 
 | Flag | Default | Notes |
 |---|---|---|
-| `--backfill START:END` | — | `YYYY-MM-DD:YYYY-MM-DD` historical window |
+| `--backfill START:END` | — | `YYYY-MM-DD:YYYY-MM-DD` historical window (additive) |
 | `--forecast` | — | Pull latest forecast |
 | `--forecast-days N` | 14 | Forecast horizon (Open-Meteo max 16) |
 | `--concurrency N` | 5 | Max in-flight HTTP requests |
 | `--skip-check` | off | Skip the preflight Open-Meteo healthcheck |
+| `--force` | off | Ignore the coverage manifest; re-fetch every chunk |
 
 ---
 
@@ -198,42 +199,42 @@ ORDER  BY hottest DESC;
 
 ## Workflow 4 — train + evaluate the model
 
-### Sync gold to local disk (optional — train can also read directly from MinIO)
+### Train (fresh run)
 
 ```powershell
-docker run --rm --entrypoint /bin/sh --network data_engine_default `
-  -v ${PWD}/data:/host_data minio/mc:latest -c `
-  "mc alias set local http://minio:9000 minioadmin minioadmin > /dev/null && `
-   mc mirror --overwrite local/weather-lake/gold/weather_features/ /host_data/lake/gold/weather_features/"
-```
-
-### Train
-
-```powershell
-# Local sync'd gold
-python -m ml.train --gold data/lake/gold/weather_features --epochs 30
-
-# OR straight from MinIO (no local sync needed)
 $env:S3_ENDPOINT='http://localhost:9000'
 $env:S3_ACCESS_KEY='minioadmin'
 $env:S3_SECRET_KEY='minioadmin'
 python -m ml.train --gold s3://weather-lake/gold/weather_features --epochs 30
 ```
 
-Artifacts land in `checkpoints/`:
-- `best.pt` — model weights + spec + feature stats
-- `best.metrics.json` — summary
-- `train.log` — full timestamped console output
-- `training_log.csv` — per-epoch (epoch, train_mse, val_mse, is_best)
-- `loss_curves.png` — train + val MSE chart
+Reads gold parquet directly from MinIO (no local sync). Each run records a row in the Postgres `models` table (Phase 2b) and writes versioned artifacts to `checkpoints/`:
+
+- `<version>.pt` — versioned weights + spec + feature stats + provenance (data range, gold row count, optimizer state)
+- `<version>.metrics.json` — summary
+- `<version>_log.csv` — per-epoch (epoch, train_mse, val_mse, is_best)
+- `<version>_loss.png` — train + val MSE chart
+- `best.pt` — copy of the latest run (used by the predictor + Streamlit)
+- `train.log` — timestamped console output
+
+`<version>` is an ISO-8601 timestamp (Windows-safe filename, e.g. `2026-05-24T13-15-22Z`).
+
+### Continue training from a checkpoint
+
+```powershell
+python -m ml.train --gold s3://weather-lake/gold/weather_features `
+  --resume checkpoints/best.pt --extra-epochs 5
+```
+
+Loads the previous state dict + optimizer state and continues from `epoch = checkpoint["epoch"] + 1`. Refuses to run if `feature_columns` or hidden/layers differ — schema-drift guard.
 
 ### Evaluate (backtest the saved checkpoint)
 
 ```powershell
-python -m ml.evaluate --gold data/lake/gold/weather_features
+python -m ml.evaluate --gold s3://weather-lake/gold/weather_features
 ```
 
-Additional artifacts:
+Artifacts:
 - `eval.log` — timestamped output
 - `per_horizon_metrics.csv` — h_ahead, MAE, RMSE, MAPE
 - `per_horizon_error.png` — MAE/RMSE bars + persistence baseline
@@ -243,7 +244,7 @@ Additional artifacts:
 
 | Flag | Default |
 |---|---|
-| `--gold PATH` | required |
+| `--gold PATH` | required (must be `s3://...`) |
 | `--seq-in` | 24 (hours of context) |
 | `--seq-out` | 6 (hours to predict) |
 | `--batch-size` | 32 |
@@ -253,45 +254,56 @@ Additional artifacts:
 | `--layers` | 2 (LSTM layers) |
 | `--val-fraction` | 0.2 (time-based split) |
 | `--seed` | 42 |
-| `--checkpoint` | `checkpoints/best.pt` |
+| `--checkpoint-dir` | `checkpoints` |
+| `--resume PATH` | — | Continue from a checkpoint |
+| `--extra-epochs N` | 0 | Epochs to add on top of the resume point |
+| `--no-register` | off | Skip writing a row to the Postgres `models` table |
 
 ---
 
-## Workflow 5 — serve forecasts over HTTP
+## Workflow 5 — drive the pipeline from the Streamlit dashboard
+
+> Phase 2c replaced FastAPI with a single Streamlit control plane. The dashboard runs as a Docker service (`weather_dashboard`) and is the recommended way to operate the pipeline.
+
+### Open the dashboard
 
 ```powershell
-# Start the server (foreground)
-uvicorn serving.api:app --host 0.0.0.0 --port 8000
-
-# OR in another window in the background
-uvicorn serving.api:app --host 0.0.0.0 --port 8000 --log-level warning
+docker compose up -d dashboard
+start http://localhost:8501
 ```
 
-Hit it:
+(Or run natively with `streamlit run dashboard/app.py --server.port 8501` from an activated venv — useful for development.)
 
-```powershell
-# Liveness + model summary
-curl http://localhost:8000/health
+### Pages
 
-# Which grid points do we have data for?
-curl http://localhost:8000/grid_points
+| Page | What it does |
+|---|---|
+| **Status** | Coverage summary, registered models table, recent Airflow run states |
+| **Data** | Pick a date range → "Backfill missing days" triggers the Airflow DAG with conf |
+| **Train** | Browse versioned checkpoints, plot loss curves with Plotly, kick off the training DAG |
+| **Predict** | Pick a grid cell → forecast (persisted to Postgres); second tab plots historical predicted vs. actual |
+| **Browse** | Pre-canned warehouse SQL summaries + a link out to Adminer |
 
-# Forecast for an arbitrary (lat, lon) — snaps to nearest known grid cell
-curl -X POST http://localhost:8000/forecast `
-  -H "Content-Type: application/json" `
-  -d '{"lat": 40.18, "lon": 44.51}'
-
-# Swagger UI
-start http://localhost:8000/docs
-```
-
-### Config (env vars)
+### Config (env vars consumed by the dashboard)
 
 | Var | Default |
 |---|---|
 | `MODEL_CHECKPOINT` | `checkpoints/best.pt` |
-| `GOLD_PATH` | `data/lake/gold/weather_features` (local) or `s3://...` |
+| `GOLD_PATH` | `s3://weather-lake/gold/weather_features` |
+| `CHECKPOINT_DIR` | `checkpoints` |
 | `S3_ENDPOINT`, `S3_ACCESS_KEY`, `S3_SECRET_KEY` | MinIO defaults |
+| `POSTGRES_HOST/PORT/DB/USER/PASSWORD` | docker-compose defaults |
+| `AIRFLOW_BASE_URL`, `AIRFLOW_USER`, `AIRFLOW_PASSWORD` | `http://localhost:8081`, `admin`, `admin` |
+| `WEATHER_DAG_ID` | `weather_pipeline` |
+| `ADMINER_URL` | `http://localhost:8082` |
+
+### Browse the warehouse directly (Adminer)
+
+```powershell
+start http://localhost:8082
+```
+
+Server: `postgres` (use that hostname from the Adminer container). User `weather`, DB `weather_dw`, password from `.env`.
 
 ---
 
@@ -339,10 +351,11 @@ Always run these four before `git commit`:
 . .\.venv\Scripts\Activate.ps1
 ruff check .                                    # lint (auto-fix: ruff check --fix .)
 ruff format --check .                           # format (auto-fix: ruff format .)
-pytest tests/ -q                                # tests (currently 26)
-python -c "import ingestion, ingestion.grid, ingestion.schemas, ingestion.openmeteo_client, `
-  ingestion.storage, ingestion.run_ingest, ingestion.healthcheck, ml, ml.dataset, ml.train, `
-  ml.evaluate, ml.logging_utils, ml.models.lstm, serving, serving.api, serving.predictor; `
+pytest tests/ -q                                # tests
+python -c "import ingestion.run_ingest, ingestion.coverage, ingestion.storage, ingestion.healthcheck, `
+  ml.dataset, ml.train, ml.evaluate, ml.models.lstm, `
+  serving.predictor, warehouse.client, warehouse.actuals_backfill, `
+  dashboard.state, dashboard.airflow_api; `
   print('venv imports OK')"
 ```
 

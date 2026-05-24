@@ -21,9 +21,9 @@ numpy>=1.26
 scikit-learn>=1.4
 matplotlib>=3.8
 
-# --- Serving ---
-fastapi>=0.110
-uvicorn[standard]>=0.27
+# --- Dashboard (Phase 2c: Streamlit replaces FastAPI as the single UI) ---
+streamlit>=1.32
+plotly>=5.20
 
 # --- Dev / test ---
 pytest>=8.0

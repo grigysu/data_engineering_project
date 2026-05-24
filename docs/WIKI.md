@@ -14,7 +14,7 @@ Look things up here. Not a tutorial — for that, see [USAGE.md](USAGE.md); for 
   - [Bronze JSON](#bronze-json)
   - [Silver / Gold Parquet](#silver--gold-parquet)
   - [Postgres star schema](#postgres-star-schema)
-- [API reference](#api-reference)
+- [Dashboard reference](#dashboard-reference)
 - [Airflow DAG reference](#airflow-dag-reference)
 - [GPU](#gpu)
 - [Git log + commit conventions](#git-log--commit-conventions)
@@ -37,8 +37,12 @@ Look things up here. Not a tutorial — for that, see [USAGE.md](USAGE.md); for 
 | `weather_airflow_init` | `weather_airflow:latest` (custom) | One-shot: `airflow db migrate` + create admin user | — |
 | `weather_airflow_webserver` | `weather_airflow:latest` | Airflow UI | — |
 | `weather_airflow_scheduler` | `weather_airflow:latest` | Airflow scheduler (LocalExecutor) | — |
+| `weather_dashboard` | `weather_dashboard:latest` (custom) | Streamlit control plane on :8501 | — |
+| `weather_adminer` | `adminer:latest` | Postgres web SQL viewer on :8082 | — |
 
-The custom `weather_airflow:latest` image is built from [docker/airflow/Dockerfile](../docker/airflow/Dockerfile): extends `apache/airflow:2.10.5-python3.11` with `docker.io` (CLI) + our runtime deps (httpx, pydantic, dotenv, boto3, pyarrow, pandas, torch CPU, numpy, scikit-learn, matplotlib).
+The custom `weather_airflow:latest` image is built from [docker/airflow/Dockerfile](../docker/airflow/Dockerfile): extends `apache/airflow:2.10.5-python3.11` with `docker.io` (CLI) + our runtime deps (httpx, pydantic, dotenv, boto3, pyarrow, pandas, psycopg2-binary, torch CPU, numpy, scikit-learn, matplotlib).
+
+The custom `weather_dashboard:latest` image is built from [docker/dashboard/Dockerfile](../docker/dashboard/Dockerfile): slim `python:3.11-slim` + CPU torch + streamlit + plotly + our deps. Source is bind-mounted at runtime so dashboard edits don't require a rebuild.
 
 ## Ports
 
@@ -52,7 +56,8 @@ The custom `weather_airflow:latest` image is built from [docker/airflow/Dockerfi
 | **4040** | spark-master | Spark application UI (only while a job runs) |
 | **9083** | hive-metastore | Hive Thrift metastore |
 | **8081** | airflow-webserver | Airflow web UI (`admin`/`admin`) |
-| **8000** | (host) uvicorn | FastAPI inference — not in compose, run manually |
+| **8501** | dashboard | Streamlit control plane — main UI |
+| **8082** | adminer | Postgres web SQL viewer |
 
 ## Environment variables
 
@@ -60,17 +65,17 @@ Loaded from `.env` (copy from `.env.example`). All have working defaults.
 
 ### Storage / MinIO
 
+Phase 2a removed the local-FS backend. MinIO is the only storage; the `STORAGE_BACKEND` env var is gone.
+
 | Var | Default | Used by |
 |---|---|---|
-| `STORAGE_BACKEND` | `local` | `ingestion.storage` (`local` → fs, `s3` → MinIO) |
 | `MINIO_ROOT_USER` | `minioadmin` | MinIO + ingestion S3 client |
 | `MINIO_ROOT_PASSWORD` | `minioadmin` | MinIO + ingestion S3 client |
 | `MINIO_ENDPOINT` | `http://localhost:9000` | Ingestion S3 client |
 | `MINIO_BUCKET` | `weather-lake` | Ingestion + bootstrap |
 | `MINIO_REGION` | `us-east-1` | Ingestion S3 client |
-| `LOCAL_LAKE_PATH` | `./data/lake` | `LocalBronzeStorage` |
 
-For PyArrow's S3FileSystem (used by `ml.dataset.load_gold` on s3:// paths):
+For PyArrow's S3FileSystem (used by `ml.dataset.load_gold` for `s3://` paths) and `ingestion.coverage.s3_client_from_env`:
 
 | Var | Default |
 |---|---|
@@ -106,13 +111,19 @@ For PyArrow's S3FileSystem (used by `ml.dataset.load_gold` on s3:// paths):
 | `GRID_LON_MAX` | `46.63` |
 | `GRID_SIZE` | `10` (→ 10×10 = 100 points) |
 
-### Ingestion / serving
+### Ingestion / predictor / dashboard
 
-| Var | Default |
-|---|---|
-| `INGEST_CONCURRENCY` | `5` (max in-flight HTTP requests) |
-| `MODEL_CHECKPOINT` | `checkpoints/best.pt` |
-| `GOLD_PATH` | `data/lake/gold/weather_features` |
+| Var | Default | Used by |
+|---|---|---|
+| `INGEST_CONCURRENCY` | `5` | `ingestion.run_ingest` |
+| `MODEL_CHECKPOINT` | `checkpoints/best.pt` | predictor + dashboard |
+| `GOLD_PATH` | `s3://weather-lake/gold/weather_features` | predictor + dashboard |
+| `CHECKPOINT_DIR` | `checkpoints` | dashboard (loss-curve discovery) |
+| `WEATHER_DAG_ID` | `weather_pipeline` | dashboard |
+| `AIRFLOW_BASE_URL` | `http://localhost:8081` | dashboard → Airflow REST API |
+| `AIRFLOW_USER` | `admin` | dashboard |
+| `AIRFLOW_PASSWORD` | `admin` | dashboard |
+| `ADMINER_URL` | `http://localhost:8082` | dashboard (Browse page link) |
 
 ## Postgres databases
 
@@ -120,7 +131,7 @@ All three live in the single `weather_postgres` container.
 
 | DB | Owner | Purpose | Initialized by |
 |---|---|---|---|
-| `weather_dw` | `weather` | Star schema (`fact_weather_observations`, `dim_location`, `dim_time`) | DDL in [warehouse/ddl/](../warehouse/ddl/), run by hand |
+| `weather_dw` | `weather` | Star schema (`fact_weather_observations`, `dim_location`, `dim_time`) + Phase 2b tables (`predictions`, `models`) | DDL in [warehouse/ddl/](../warehouse/ddl/), run by hand |
 | `metastore_db` | `hive` | Hive Metastore's metadata (table defs, partitions) | `hive_init` runs `schematool -initOrUpgradeSchema` |
 | `airflow_db` | `airflow` | Airflow metadata (DAG runs, task instances, users) | `airflow_init` runs `airflow db migrate` |
 
@@ -162,7 +173,7 @@ weather-lake/
 ```
 data_engine/
 ├── README.md                       Front door
-├── docker-compose.yml              Full stack (12 services)
+├── docker-compose.yml              Full stack (~14 services)
 ├── requirements.txt                Native venv deps
 ├── .env.example                    Config template
 ├── .gitignore
@@ -176,8 +187,9 @@ data_engine/
 │   ├── grid.py                     Armenia 10×10 grid generator
 │   ├── schemas.py                  Pydantic models for Open-Meteo responses
 │   ├── openmeteo_client.py         Async HTTPX client with bounded retries
-│   ├── storage.py                  BronzeStorage protocol (local + S3)
-│   ├── run_ingest.py               CLI entrypoint (--backfill / --forecast)
+│   ├── storage.py                  S3BronzeStorage (MinIO only — Phase 2a)
+│   ├── coverage.py                 Gold-coverage manifest + missing-date math
+│   ├── run_ingest.py               CLI: additive --backfill / --forecast / --force
 │   └── healthcheck.py              Layered DNS/TCP/HTTP probe + CLI
 │
 ├── spark_jobs/                     PySpark, runs inside spark-master
@@ -186,42 +198,53 @@ data_engine/
 │   └── load_to_warehouse.py        Star schema load via JDBC
 │
 ├── warehouse/
-│   ├── ddl/                        Postgres star-schema DDL (numbered)
+│   ├── ddl/                        Postgres DDL (numbered, run by hand)
 │   │   ├── 001_dim_location.sql
 │   │   ├── 002_dim_time.sql
-│   │   └── 003_fact_weather_observations.sql
+│   │   ├── 003_fact_weather_observations.sql
+│   │   ├── 004_predictions.sql        (Phase 2b)
+│   │   └── 005_models.sql             (Phase 2b)
+│   ├── client.py                   psycopg2 helpers (predictions + model registry)
+│   ├── actuals_backfill.py         CLI: fill predictions.actual_value
 │   └── hive/
 │       └── create_external_tables.sql  Spark SQL DDL for silver+gold
 │
 ├── ml/
-│   ├── dataset.py                  load_gold + WindowSpec + windowing
+│   ├── dataset.py                  load_gold (s3://) + WindowSpec + windowing
 │   ├── models/lstm.py              Multivariate LSTM
-│   ├── train.py                    CLI: trains + saves checkpoint + plots
+│   ├── train.py                    CLI: train + versioned checkpoints + --resume
 │   ├── evaluate.py                 CLI: backtest + per-horizon metrics
 │   └── logging_utils.py            setup_logger + plot helpers
 │
 ├── serving/
-│   ├── predictor.py                Predictor class (load + snap + predict)
-│   └── api.py                      FastAPI app
+│   └── predictor.py                Predictor class (load + snap + predict + persist)
+│
+├── dashboard/                      Streamlit control plane (Phase 2c)
+│   ├── app.py                      Entry — `streamlit run dashboard/app.py`
+│   ├── state.py                    Cached predictor / coverage / models / SQL
+│   ├── airflow_api.py              Thin REST wrapper for DAG triggers
+│   └── pages/                      Status, Data, Train, Predict, Browse
 │
 ├── airflow/
-│   └── dags/weather_pipeline.py    5-task @daily DAG
+│   └── dags/weather_pipeline.py    @daily DAG: ingest → bronze/silver/gold →
+│                                   warehouse → backfill_actuals → train_model
 │
 ├── docker/                         Compose-related extras
 │   ├── airflow/Dockerfile          Custom Airflow image (+ docker CLI + our deps)
 │   ├── airflow/requirements-airflow.txt
+│   ├── dashboard/Dockerfile        Streamlit image (slim + torch CPU + deps)
+│   ├── dashboard/requirements-dashboard.txt
 │   ├── spark/conf/spark-defaults.conf
 │   ├── hive/conf/core-site.xml     S3A config for the metastore JVM
 │   ├── hive/jdbc/postgresql-42.7.3.jar
 │   └── postgres-init/*.sql
 │
-├── tests/                          26 tests (ingestion, healthcheck, dataset, serving)
+├── tests/                          Pytest unit tests
 │
 └── (gitignored, runtime)
     ├── .venv/
     ├── .env
-    ├── data/lake/                  Local-backend bronze + mirrored gold
-    ├── checkpoints/                Model + training/eval artifacts
+    ├── checkpoints/                Versioned model + training/eval artifacts
     └── airflow/logs/               Per-task / scheduler logs
 ```
 
@@ -313,61 +336,22 @@ Surrogate keys (INTEGER, not SERIAL) are assigned deterministically by `row_numb
 
 Loader runs in **full-refresh mode**: single `TRUNCATE fact_weather_observations, dim_location, dim_time` statement (Postgres allows this without CASCADE when all referencing tables are listed), then `mode="append"`. Preserves indexes + FK constraints.
 
-## API reference
+## Dashboard reference
 
-`serving/api.py`. Run: `uvicorn serving.api:app --host 0.0.0.0 --port 8000`.
+Streamlit at http://localhost:8501. Five pages:
 
-### `GET /health`
+| Page | Module | What it does |
+|---|---|---|
+| Home | [dashboard/app.py](../dashboard/app.py) | 3-column summary: coverage, current model + stale-data warning, quickstart text |
+| Status | [pages/1_Status.py](../dashboard/pages/1_Status.py) | Coverage, model registry table, recent Airflow runs |
+| Data | [pages/2_Data.py](../dashboard/pages/2_Data.py) | Date-range picker → triggers `weather_pipeline` with `conf={start_date, end_date, force}` |
+| Train | [pages/3_Train.py](../dashboard/pages/3_Train.py) | Versioned-checkpoint table + Plotly loss curves + "Train fresh" button |
+| Predict | [pages/4_Predict.py](../dashboard/pages/4_Predict.py) | Forecast for a grid cell (persisted) + history tab with predicted-vs-actual overlay |
+| Browse | [pages/5_Browse.py](../dashboard/pages/5_Browse.py) | Pre-canned SQL summaries + link to Adminer |
 
-```json
-{
-  "status": "ok",
-  "device": "cuda",
-  "seq_in_hours": 24,
-  "horizon_hours": 6,
-  "feature_count": 19,
-  "grid_size": 4
-}
-```
+The dashboard imports `serving.predictor.Predictor` directly (no HTTP) — `@st.cache_resource` keeps it loaded across reruns. Postgres + MinIO access is cached with short TTLs; the sidebar's "Refresh caches" button forces a re-read.
 
-### `GET /grid_points`
-
-```json
-{
-  "count": 4,
-  "points": [{"lat": 38.8125, "lon": 43.4375}, ...]
-}
-```
-
-### `POST /forecast`
-
-Request:
-```json
-{ "lat": 40.18, "lon": 44.51 }
-```
-
-Validated by Pydantic: `lat ∈ [-90, 90]`, `lon ∈ [-180, 180]`. Out-of-range → 422.
-
-Response (200):
-```json
-{
-  "requested_lat": 40.18,
-  "requested_lon": 44.51,
-  "snapped_lat":   41.3125,
-  "snapped_lon":   46.625,
-  "forecast_anchor": "2026-05-25 23:00:00",
-  "seq_in_hours": 24,
-  "horizon_hours": 6,
-  "predictions": [
-    { "hours_ahead": 1, "temperature_2m_c": 9.52 },
-    ...
-  ]
-}
-```
-
-`422` if the grid point has fewer than `seq_in_hours` usable rows (NaN lag features at series start can eat the first 24 hours).
-
-Auto-generated Swagger UI: http://localhost:8000/docs.
+Phase 2b added prediction persistence: every `/forecast` call writes `seq_out` rows to `weather_dw.predictions` (idempotent on `UNIQUE(model_version, location_id, prediction_made_at, target_time)`). Once observations land, the Airflow `backfill_actuals` task fills in `actual_value`.
 
 ## Airflow DAG reference
 
@@ -384,20 +368,29 @@ Auto-generated Swagger UI: http://localhost:8000/docs.
 | Default `retry_delay` | `2 min` |
 | Per-task `execution_timeout` | `30 min` |
 
-Task graph:
+Task graph (Phase 2a/2b):
 
 ```
-ingest_forecast → bronze_to_silver → silver_to_gold ┬→ load_warehouse
-                                                    └→ train_model
+ingest_archive → bronze_to_silver → silver_to_gold ┬→ load_warehouse → backfill_actuals
+                                                   └→ train_model
 ```
 
 | Task | Operator | Runs in | Command (simplified) |
 |---|---|---|---|
-| `ingest_forecast` | BashOperator | airflow container | `python -m ingestion.run_ingest --forecast --forecast-days 7 --skip-check` |
+| `ingest_archive` | BashOperator | airflow container | `python -m ingestion.run_ingest --backfill {ds-32}:{ds-2} --skip-check` (additive; params can override range + force) |
 | `bronze_to_silver` | BashOperator | spark-master (via docker exec) | `spark-submit /opt/jobs/bronze_to_silver.py` |
 | `silver_to_gold` | BashOperator | spark-master | `spark-submit /opt/jobs/silver_to_gold.py` |
 | `load_warehouse` | BashOperator | spark-master | `spark-submit /opt/jobs/load_to_warehouse.py` |
-| `train_model` | BashOperator | airflow container | `python -m ml.train --gold s3://weather-lake/gold/weather_features --epochs 20` |
+| `backfill_actuals` | BashOperator | airflow container | `python -m warehouse.actuals_backfill` |
+| `train_model` | BashOperator | airflow container | `python -m ml.train --gold s3://weather-lake/gold/weather_features --epochs 20` (writes a row to `models`) |
+
+DAG params (settable from the Streamlit Data page or from the Airflow UI's "Trigger w/ config" button):
+
+| Param | Type | Default |
+|---|---|---|
+| `start_date` | string (YYYY-MM-DD) | `""` → `logical_date − 32d` |
+| `end_date` | string (YYYY-MM-DD) | `""` → `logical_date − 2d` (archive lag) |
+| `force` | boolean | `false` |
 
 The `docker exec`-style tasks work because the host's `/var/run/docker.sock` is bind-mounted into the Airflow scheduler container, and `docker.io` is installed in the custom Airflow image.
 
@@ -428,16 +421,12 @@ The serving layer also uses CUDA automatically if available.
 Phase-by-phase, one focused commit per slice:
 
 ```
-Phase N[a/b]: <one-line summary>
+Phase N[a/b/c]: <one-line summary>
 
 <a few paragraphs explaining what, why, and how>
-
-Quality gates green: ruff check / ruff format / N/N pytest / venv imports OK.
-
-Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
 ```
 
-Multi-line commit messages are written via a temp file (`git commit -F .git-commit-msg.tmp`) to dodge PowerShell here-string parsing bugs with parentheses and emoji.
+Multi-line commit messages are written via a HEREDOC (`git commit -m "$(cat <<'EOF' … EOF\n)"`) to dodge PowerShell parsing bugs.
 
 ## External resources
 
@@ -446,5 +435,7 @@ Multi-line commit messages are written via a temp file (`git commit -F .git-comm
 - **Apache Hive 4.0 metastore**: https://hive.apache.org/docs/latest/
 - **Airflow 2.10 docs**: https://airflow.apache.org/docs/apache-airflow/2.10.5/
 - **PyTorch CUDA wheel index**: https://download.pytorch.org/whl/
-- **FastAPI**: https://fastapi.tiangolo.com/
+- **Streamlit docs**: https://docs.streamlit.io/
+- **Plotly Python**: https://plotly.com/python/
+- **Adminer**: https://www.adminer.org/
 - **MinIO client (mc) reference**: https://min.io/docs/minio/linux/reference/minio-mc.html

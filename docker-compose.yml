@@ -230,6 +230,63 @@ services:
       airflow_init:
         condition: service_completed_successfully
 
+  # ---------- Streamlit dashboard (Phase 2c) ----------
+  # Single user-facing UI: status, data backfill, training, predict + compare,
+  # warehouse browse. Replaces the FastAPI service entirely.
+  dashboard:
+    build:
+      context: .
+      dockerfile: docker/dashboard/Dockerfile
+    image: weather_dashboard:latest
+    container_name: weather_dashboard
+    environment:
+      # MinIO (predictor + coverage scan)
+      MINIO_BUCKET: ${MINIO_BUCKET:-weather-lake}
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      S3_ENDPOINT: http://minio:9000
+      S3_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+      S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      # Postgres
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-weather_dw}
+      POSTGRES_USER: ${POSTGRES_USER:-weather}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-weather}
+      # Airflow REST API
+      AIRFLOW_BASE_URL: http://airflow_webserver:8080
+      AIRFLOW_USER: admin
+      AIRFLOW_PASSWORD: admin
+      # Predictor defaults
+      MODEL_CHECKPOINT: /app/checkpoints/best.pt
+      GOLD_PATH: s3://weather-lake/gold/weather_features
+      CHECKPOINT_DIR: /app/checkpoints
+      # Adminer (Phase 2d)
+      ADMINER_URL: http://localhost:8082
+    ports:
+      - "8501:8501"
+    volumes:
+      - .:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+
+  # ---------- Adminer (Phase 2d preview, lightweight Postgres UI) ----------
+  adminer:
+    image: adminer:latest
+    container_name: weather_adminer
+    environment:
+      ADMINER_DEFAULT_SERVER: postgres
+      ADMINER_DESIGN: dracula
+    ports:
+      - "8082:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
 volumes:
   minio_data:
   postgres_data:
