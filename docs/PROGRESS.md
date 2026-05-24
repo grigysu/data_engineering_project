@@ -34,7 +34,7 @@ You can think of it as: "all the preprocessing infrastructure that real ML syste
 
 ```
 ┌──────────────┐   1. INGEST    ┌──────────────┐
-│  Open-Meteo  │ ───────────▶   │   bronze/    │  raw JSON, one file per
+│  Open-Meteo  │ ───────────>   │   bronze/    │  raw JSON, one file per
 │   (free API) │   Python +     │  (MinIO,     │  (region, dataset, time-window,
 └──────────────┘   httpx        │   S3-like)   │   grid point)
                                 └──────┬───────┘
@@ -55,12 +55,12 @@ You can think of it as: "all the preprocessing infrastructure that real ML syste
                                        │ 4. LOAD TO WAREHOUSE
                                        │   (Spark → JDBC)
                                        ▼
-                                ┌──────────────────────────┐
-                                │  Postgres (weather_dw):  │  Star schema for
-                                │  • dim_location          │  human-driven SQL
-                                │  • dim_time              │  analytics + BI
+                                ┌──────────────────────────────┐
+                                │  Postgres (weather_dw):      │  Star schema for
+                                │  • dim_location              │  human-driven SQL
+                                │  • dim_time                  │  analytics + BI
                                 │  • fact_weather_observations │  tools.
-                                └──────────────────────────┘
+                                └──────────────────────────────┘
 
            ┌─────────────────────────────────────────┐
            │  Hive Metastore (separate from Postgres │  Records "this Parquet
@@ -290,15 +290,15 @@ The lake is the "training plane." The warehouse is the "human plane." Real compa
 ### The star schema
 
 ```
-                  ┌──────────────────────────┐
-                  │ fact_weather_observations│
-                  │  • location_id  (FK)     │
-                  │  • time_id      (FK)     │
-                  │  • dataset      ('forecast'|'archive')
-                  │  • temperature_2m        │
-                  │  • wind_speed_10m        │
-                  │  • ... (9 more measures) │
-                  └────┬──────────────┬──────┘
+                  ┌────────────────────────────────────────┐
+                  │ fact_weather_observations              │
+                  │  • location_id  (FK)                   │
+                  │  • time_id      (FK)                   │
+                  │  • dataset      ('forecast'|'archive') |
+                  │  • temperature_2m                      │
+                  │  • wind_speed_10m                      │
+                  │  • ... (9 more measures)               │
+                  └────┬──────────────┬────────────────────┘
                        │              │
         ┌──────────────▼┐            ┌▼──────────────┐
         │ dim_location  │            │ dim_time      │
