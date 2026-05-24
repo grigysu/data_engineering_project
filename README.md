@@ -1,9 +1,6 @@
 # Weather Data Pipeline + ML Forecasting
 
 End-to-end data engineering + ML system that pulls weather data for **Armenia** (10×10 lat/lon grid), runs it through a Bronze→Silver→Gold lake with PySpark, lands it in a Postgres star schema, trains a PyTorch LSTM, serves predictions over HTTP, and orchestrates the whole thing with Airflow.
-
-Built as a portfolio piece showing the full modern data stack glued together on one laptop.
-
 ---
 
 ## Documentation map
