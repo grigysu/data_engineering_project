@@ -1,103 +1,189 @@
-"""Streamlit entry for the weather pipeline control plane.
+"""Weather pipeline — map + graph (single page, read-only).
+
+The Airflow DAG owns ingestion, training, and per-cell forecast
+generation. This page just reads what's in Postgres and renders it:
+click a grid cell on the map → see hourly actuals continued by the
+model's latest forecast.
 
 Run locally:
     streamlit run dashboard/app.py --server.port 8501
-
-The sidebar holds shared config (paths, refresh button); each page in
-`dashboard/pages/` is auto-discovered by Streamlit's multipage routing.
 """
 
 from __future__ import annotations
 
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
 from dotenv import load_dotenv
 
 from dashboard.state import (
-    DEFAULT_GOLD,
-    fetch_best_model,
-    fetch_coverage,
-    sidebar_config,
+    DEFAULT_CHECKPOINT,
+    read_checkpoint_meta,
+    run_query,
 )
+
 
 load_dotenv()
+st.set_page_config(page_title="Weather Pipeline", layout="wide")
+st.title("Weather forecast — Armenia")
 
-st.set_page_config(
-    page_title="Weather Pipeline",
-    page_icon=None,
-    layout="wide",
+meta = read_checkpoint_meta(DEFAULT_CHECKPOINT)
+if meta:
+    parts = [f"Model `{meta.get('model_version') or '—'}`"]
+    if meta.get("data_range_start") and meta.get("data_range_end"):
+        parts.append(
+            f"trained on `{meta['data_range_start']} → {meta['data_range_end']}`"
+        )
+    if meta.get("best_val_mse") is not None:
+        parts.append(f"val MSE {meta['best_val_mse']:.4f}")
+    st.caption(" · ".join(parts))
+else:
+    st.caption(f"No checkpoint at `{DEFAULT_CHECKPOINT}` yet — waiting for the DAG.")
+
+# --- 1. Grid cell map ---
+locs = run_query(
+    "SELECT location_id, lat, lon, region FROM dim_location ORDER BY location_id"
+)
+if locs.empty:
+    st.warning(
+        "No locations yet. Wait for the daily Airflow DAG to populate `dim_location` "
+        "(or trigger it manually from http://localhost:8081)."
+    )
+    st.stop()
+
+st.markdown("### Click a grid cell")
+fig_map = px.scatter_mapbox(
+    locs,
+    lat="lat",
+    lon="lon",
+    hover_data={"location_id": True, "lat": ":.4f", "lon": ":.4f", "region": False},
+    zoom=6,
+    height=420,
+)
+fig_map.update_traces(marker=dict(size=11, color="#d62728"))
+fig_map.update_layout(
+    mapbox_style="open-street-map",
+    mapbox_center=dict(lat=locs["lat"].mean(), lon=locs["lon"].mean()),
+    margin={"l": 0, "r": 0, "t": 0, "b": 0},
+)
+event = st.plotly_chart(
+    fig_map,
+    on_select="rerun",
+    key="cellmap",
+    use_container_width=True,
+    selection_mode=("points",),
 )
 
-cfg = sidebar_config()
+# --- 2. Selected cell (fallback to first cell) ---
+# Streamlit's plotly on_select doesn't reliably surface customdata for
+# scatter_mapbox; use point_index (the row index into `locs`) instead.
+selected_id = int(locs["location_id"].iloc[0])
+if event and event.get("selection", {}).get("points"):
+    point = event["selection"]["points"][0]
+    point_idx = point.get("point_index")
+    if point_idx is None:
+        point_idx = point.get("point_number")
+    if point_idx is not None and 0 <= point_idx < len(locs):
+        selected_id = int(locs.iloc[point_idx]["location_id"])
 
-st.title("Weather Pipeline — control plane")
-st.caption(
-    "One place to see what data exists, expand the date range, retrain the "
-    "model, browse the warehouse, and compare predictions vs. actuals."
+row = locs[locs["location_id"] == selected_id].iloc[0]
+st.markdown(
+    f"#### Cell `{selected_id}` — ({row['lat']:.4f}, {row['lon']:.4f}) · {row['region']}"
 )
 
-# Quick-glance summary on the landing page; full detail lives on each page.
-col1, col2, col3 = st.columns(3)
-
-cov = fetch_coverage()
+# --- 3. Date-range sliders ---
+col1, col2 = st.columns(2)
 with col1:
-    st.subheader("Ingested data")
-    if cov and cov.archive:
-        st.metric(
-            "Archive dates",
-            len(cov.archive),
-            help=f"{min(cov.archive)} → {max(cov.archive)}",
-        )
-    else:
-        st.info("No archive data yet. Use the **Data** page to backfill.")
-
-best = fetch_best_model()
+    actuals_days = st.slider(
+        "Actuals lookback (days)",
+        min_value=1,
+        max_value=30,
+        value=7,
+        help="How far back to plot observed temperatures.",
+    )
 with col2:
-    st.subheader("Current model")
-    if best:
-        st.metric(
-            "Best val MSE",
-            f"{best.best_val_mse:.4f}" if best.best_val_mse is not None else "—",
-        )
-        st.caption(
-            f"Version `{best.model_version}` · trained on "
-            f"`{best.data_range_start} → {best.data_range_end}`"
-            if best.data_range_start
-            else f"Version `{best.model_version}`"
-        )
-        # Stale-data warning: if gold extends past the model's trained range.
-        if best.data_range_end and cov and cov.archive:
-            gold_end = max(cov.archive)
-            if gold_end > best.data_range_end:
-                st.warning(
-                    f"Model is stale — gold has data through **{gold_end}** "
-                    f"but model was trained up to **{best.data_range_end}**. "
-                    "Retrain from the **Train** page."
-                )
-    else:
-        st.info("No registered models yet. Train one from the **Train** page.")
-
-with col3:
-    st.subheader("Gold lake")
-    st.caption(f"`{DEFAULT_GOLD}`")
-    st.caption(f"Checkpoint: `{cfg['checkpoint']}`")
-    st.caption(
-        "Use the sidebar pages: **Data** to extend the range, **Train** for the "
-        "model, **Predict** to forecast a cell, **Browse** for the warehouse."
+    horizon_hours = st.slider(
+        "Prediction horizon (hours)",
+        min_value=1,
+        max_value=24,
+        value=6,
+        help="How far into the future to plot the latest forecast.",
     )
 
-st.divider()
-st.markdown(
+# --- 4. Actuals (observed temperatures from the warehouse) ---
+actuals = run_query(
     """
-    ### How to use this dashboard
-
-    1. **Data** — pick a date range and click *Backfill missing days*. The
-       Airflow DAG runs ingestion → bronze → silver → gold → warehouse.
-    2. **Train** — start a fresh training run, or continue an existing one for
-       a few more epochs. Watch the loss curves live (Plotly).
-    3. **Predict** — pick a grid cell. The model's forecast is written to
-       Postgres, and the **Predicted vs. Actual** chart shows historical
-       predictions against the observations that arrived later.
-    4. **Browse** — quick SQL summaries, or jump out to Adminer for ad-hoc
-       queries.
-    """
+    SELECT t.observed_at, f.temperature_2m
+    FROM fact_weather_observations f
+    JOIN dim_time t ON t.time_id = f.time_id
+    WHERE f.location_id = %s
+      AND f.dataset = 'archive'
+      AND t.observed_at >= NOW() - (%s || ' days')::interval
+    ORDER BY t.observed_at
+    """,
+    (selected_id, actuals_days),
 )
+
+# --- 5. Predictions (latest snapshot per target_time, future-facing only) ---
+preds = run_query(
+    """
+    SELECT DISTINCT ON (target_time) target_time, predicted_value
+    FROM predictions
+    WHERE location_id = %s
+      AND target_time >= NOW()
+      AND target_time <= NOW() + (%s || ' hours')::interval
+    ORDER BY target_time, prediction_made_at DESC
+    """,
+    (selected_id, horizon_hours),
+)
+
+# --- 6. Combined chart ---
+fig = go.Figure()
+if not actuals.empty:
+    fig.add_trace(
+        go.Scatter(
+            x=actuals["observed_at"],
+            y=actuals["temperature_2m"],
+            name="Actual",
+            mode="lines",
+            line=dict(color="#1f77b4"),
+        )
+    )
+if not preds.empty:
+    fig.add_trace(
+        go.Scatter(
+            x=preds["target_time"],
+            y=preds["predicted_value"],
+            name="Predicted",
+            mode="lines+markers",
+            line=dict(color="#d62728", dash="dash"),
+        )
+    )
+now_iso = pd.Timestamp.utcnow().isoformat()
+fig.add_vline(x=now_iso, line=dict(dash="dot", color="gray"))
+# Annotation added separately — passing annotation_text to add_vline triggers
+# a plotly bug that averages x/y coordinates and crashes on date axes.
+fig.add_annotation(
+    x=now_iso,
+    y=1.0,
+    xref="x",
+    yref="paper",
+    text="now",
+    showarrow=False,
+    yanchor="bottom",
+    font=dict(color="gray"),
+)
+fig.update_layout(
+    xaxis_title="time (UTC)",
+    yaxis_title="temperature (°C)",
+    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    height=420,
+)
+st.plotly_chart(fig, use_container_width=True)
+
+if actuals.empty and preds.empty:
+    st.info(
+        "No data for this cell yet. The next Airflow run will populate it "
+        "(or trigger one from http://localhost:8081)."
+    )

@@ -185,6 +185,10 @@ services:
       AIRFLOW__CORE__FERNET_KEY: ""    # auto-generated each run is fine for local dev
       AIRFLOW__WEBSERVER__SECRET_KEY: "weather-dev-secret-not-for-prod"
       AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "true"
+      # Phase 2c: enable basic-auth on the REST API so the Streamlit dashboard can
+      # trigger DAGs. Order matters — `basic_auth` first so httpx Authorization
+      # headers are honored; `session` still works for browser-driven calls.
+      AIRFLOW__API__AUTH_BACKENDS: "airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session"
       AIRFLOW_UID: "0"
     entrypoint: ["/bin/bash", "-c"]
     # Array form so the whole string is a single argv[1] to bash -c, not
@@ -226,6 +230,16 @@ services:
       - ./airflow/logs:/opt/airflow/logs
       - .:/opt/weather
       - /var/run/docker.sock:/var/run/docker.sock
+    # GPU passthrough so train_model + predict_all_cells use CUDA.
+    # Requires NVIDIA Container Toolkit on the host (Docker Desktop with
+    # WSL2 + a recent NVIDIA driver covers this on Windows).
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
     depends_on:
       airflow_init:
         condition: service_completed_successfully
@@ -240,6 +254,9 @@ services:
     image: weather_dashboard:latest
     container_name: weather_dashboard
     environment:
+      # Make the repo root importable as a package root (so `from dashboard.state
+      # import …` works — Streamlit only adds the script's own dir to sys.path).
+      PYTHONPATH: /app
       # MinIO (predictor + coverage scan)
       MINIO_BUCKET: ${MINIO_BUCKET:-weather-lake}
       MINIO_ENDPOINT: http://minio:9000

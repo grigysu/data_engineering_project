@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
 from unittest.mock import MagicMock
 
 from warehouse.client import (
     PredictionRow,
     insert_predictions,
-    register_model,
     transaction,
 )
 
@@ -69,34 +68,6 @@ def test_insert_predictions_empty_list_short_circuits():
     )
     assert n == 0
     cur.executemany.assert_not_called()
-
-
-def test_register_model_upserts_and_reelects_best():
-    conn, cur = _mock_conn()
-    register_model(
-        conn,
-        model_version="2026-05-24T10-00-00Z",
-        trained_at=datetime(2026, 5, 24, 10, 0, tzinfo=timezone.utc),
-        data_range_start=date(2026, 5, 1),
-        data_range_end=date(2026, 5, 24),
-        gold_row_count=1000,
-        best_val_mse=0.42,
-        epochs=20,
-        checkpoint_path="checkpoints/2026-05-24T10-00-00Z.pt",
-        hyperparams={"hidden_size": 64, "num_layers": 2},
-    )
-    # 3 calls: upsert + clear is_best + re-elect best.
-    assert cur.execute.call_count == 3
-    upsert_sql = cur.execute.call_args_list[0].args[0]
-    assert "INSERT INTO models" in upsert_sql
-    assert "ON CONFLICT (model_version) DO UPDATE" in upsert_sql
-
-    clear_sql = cur.execute.call_args_list[1].args[0]
-    assert "is_best = FALSE" in clear_sql
-
-    elect_sql = cur.execute.call_args_list[2].args[0]
-    assert "is_best = TRUE" in elect_sql
-    assert "ORDER BY best_val_mse ASC" in elect_sql
 
 
 def test_transaction_commits_on_clean_exit():

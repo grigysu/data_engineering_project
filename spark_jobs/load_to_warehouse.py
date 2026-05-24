@@ -1,15 +1,17 @@
 """Silver -> Postgres star schema (dim_location, dim_time, fact_weather_observations).
 
-Reads the silver Parquet from MinIO, builds dimension tables with deterministic
-surrogate keys (row_number over a stable sort), joins to produce the fact rows,
-and writes everything via JDBC to weather_dw.
+Reads the silver Parquet from MinIO, upserts dims (so existing surrogate
+IDs survive across runs — predictions reference dim_location.location_id),
+joins to produce the fact rows, and writes everything via JDBC to weather_dw.
 
 Loading strategy:
-  - DDL (run separately, see warehouse/ddl/) defines the star schema with real
-    foreign keys on the fact table — good schema hygiene + showcase value.
-  - This job runs in full-refresh mode: TRUNCATE all three tables in a single
-    statement (so we don't need CASCADE or to drop FKs), then mode=append the
-    Spark DataFrames. Atomic-ish, preserves indexes + constraints.
+  - Dims use Postgres IDENTITY for IDs. The loader writes a stage table per
+    dim, then upserts on the natural key (`(region, lat, lon)` and
+    `observed_at`) with `ON CONFLICT DO NOTHING`. Existing rows keep their
+    IDs; new cells/timestamps get fresh ones.
+  - Fact gets TRUNCATE+INSERT (it has no inbound FKs). After the dim upsert,
+    we read the persisted dims back through JDBC to pick up IDENTITY-assigned
+    IDs, then join silver against them to build the fact rows.
 
 Run from inside the spark-master container:
     docker exec weather_spark_master \\
@@ -23,7 +25,7 @@ from __future__ import annotations
 import argparse
 import sys
 
-from pyspark.sql import DataFrame, SparkSession, Window
+from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 
 
@@ -36,19 +38,15 @@ def _season_expr(month_col: F.Column) -> F.Column:
     )
 
 
-def build_dim_location(silver: DataFrame) -> DataFrame:
-    distinct = silver.select("region", "lat", "lon", "elevation").distinct()
-    # Stable surrogate key: row_number over a deterministic sort. Reproducible
-    # across runs as long as the source data doesn't change.
-    return distinct.withColumn(
-        "location_id",
-        F.row_number().over(Window.orderBy("region", "lat", "lon")),
-    ).select("location_id", "region", "lat", "lon", "elevation")
+def build_dim_location_stage(silver: DataFrame) -> DataFrame:
+    """Distinct cells, no surrogate key — Postgres assigns it on insert."""
+    return silver.select("region", "lat", "lon", "elevation").distinct()
 
 
-def build_dim_time(silver: DataFrame) -> DataFrame:
+def build_dim_time_stage(silver: DataFrame) -> DataFrame:
+    """Distinct timestamps + derived attributes — no surrogate key."""
     distinct = silver.select("observed_at").distinct()
-    with_attrs = (
+    return (
         distinct.withColumn("date", F.to_date("observed_at"))
         .withColumn("hour", F.hour("observed_at").cast("short"))
         .withColumn("day_of_week", F.dayofweek("observed_at").cast("short"))
@@ -57,34 +55,22 @@ def build_dim_time(silver: DataFrame) -> DataFrame:
         .withColumn("season", _season_expr(F.col("month")))
         .withColumn("is_weekend", F.col("day_of_week").isin(1, 7))
     )
-    return with_attrs.withColumn(
-        "time_id", F.row_number().over(Window.orderBy("observed_at"))
-    ).select(
-        "time_id",
-        "observed_at",
-        "date",
-        "hour",
-        "day_of_week",
-        "month",
-        "year",
-        "season",
-        "is_weekend",
-    )
 
 
 def build_fact(
-    silver: DataFrame, dim_location: DataFrame, dim_time: DataFrame
+    silver: DataFrame,
+    dim_location_persisted: DataFrame,
+    dim_time_persisted: DataFrame,
 ) -> DataFrame:
-    # Inner joins are safe: dims are built from silver, so every silver row
-    # finds a match.
+    """Join silver against the persisted dims to pick up IDENTITY-assigned IDs."""
     return (
         silver.join(
-            dim_location.select("location_id", "region", "lat", "lon"),
+            dim_location_persisted.select("location_id", "region", "lat", "lon"),
             on=["region", "lat", "lon"],
             how="inner",
         )
         .join(
-            dim_time.select("time_id", "observed_at"),
+            dim_time_persisted.select("time_id", "observed_at"),
             on=["observed_at"],
             how="inner",
         )
@@ -162,40 +148,75 @@ def main() -> None:
         sys.exit(0)
     print(f"[load_to_warehouse] {n_silver:,} silver rows", flush=True)
 
-    # Cache silver: the loc/time/fact stages all consume it.
     silver.cache()
 
-    dim_location = build_dim_location(silver).cache()
-    dim_time = build_dim_time(silver).cache()
-    fact = build_fact(silver, dim_location, dim_time)
-
-    n_loc = dim_location.count()
-    n_time = dim_time.count()
+    dim_location_stage = build_dim_location_stage(silver).cache()
+    dim_time_stage = build_dim_time_stage(silver).cache()
+    n_loc = dim_location_stage.count()
+    n_time = dim_time_stage.count()
     print(
-        f"[load_to_warehouse] derived dims: {n_loc} locations, {n_time} times",
+        f"[load_to_warehouse] stage dims: {n_loc} locations, {n_time} times",
         flush=True,
     )
 
-    print(
-        "[load_to_warehouse] TRUNCATE fact + dims (single statement, no CASCADE needed)",
-        flush=True,
+    # 1. Stage dims into temp tables (overwrite — Spark drops + recreates).
+    print("[load_to_warehouse] writing dim_location_stage", flush=True)
+    dim_location_stage.write.jdbc(
+        url=args.jdbc_url,
+        table="dim_location_stage",
+        mode="overwrite",
+        properties=props,
     )
+    print("[load_to_warehouse] writing dim_time_stage", flush=True)
+    dim_time_stage.write.jdbc(
+        url=args.jdbc_url,
+        table="dim_time_stage",
+        mode="overwrite",
+        properties=props,
+    )
+
+    # 2. Upsert into the real dims on the natural key (FK from predictions safe).
+    print("[load_to_warehouse] upserting dim_location", flush=True)
     jdbc_execute(
         spark,
         args.jdbc_url,
         props,
-        "TRUNCATE fact_weather_observations, dim_location, dim_time",
+        """
+        INSERT INTO dim_location (region, lat, lon, elevation)
+        SELECT region, lat, lon, elevation FROM dim_location_stage
+        ON CONFLICT (region, lat, lon) DO NOTHING
+        """,
+    )
+    print("[load_to_warehouse] upserting dim_time", flush=True)
+    jdbc_execute(
+        spark,
+        args.jdbc_url,
+        props,
+        """
+        INSERT INTO dim_time (
+            observed_at, date, hour, day_of_week, month, year, season, is_weekend
+        )
+        SELECT observed_at, date, hour, day_of_week, month, year, season, is_weekend
+        FROM dim_time_stage
+        ON CONFLICT (observed_at) DO NOTHING
+        """,
     )
 
-    print("[load_to_warehouse] writing dim_location", flush=True)
-    dim_location.write.jdbc(
-        url=args.jdbc_url, table="dim_location", mode="append", properties=props
+    # 3. Read the persisted dims back to pick up IDENTITY-assigned IDs.
+    dim_location_persisted = spark.read.jdbc(
+        url=args.jdbc_url, table="dim_location", properties=props
+    )
+    dim_time_persisted = spark.read.jdbc(
+        url=args.jdbc_url, table="dim_time", properties=props
     )
 
-    print("[load_to_warehouse] writing dim_time", flush=True)
-    dim_time.write.jdbc(
-        url=args.jdbc_url, table="dim_time", mode="append", properties=props
+    # 4. Build + write fact (no inbound FKs → TRUNCATE is safe).
+    fact = build_fact(silver, dim_location_persisted, dim_time_persisted)
+    print(
+        "[load_to_warehouse] TRUNCATE fact_weather_observations (only fact)",
+        flush=True,
     )
+    jdbc_execute(spark, args.jdbc_url, props, "TRUNCATE fact_weather_observations")
 
     print("[load_to_warehouse] writing fact_weather_observations", flush=True)
     fact.write.jdbc(
@@ -203,6 +224,15 @@ def main() -> None:
         table="fact_weather_observations",
         mode="append",
         properties=props,
+    )
+
+    # 5. Drop the stage tables.
+    print("[load_to_warehouse] dropping stage tables", flush=True)
+    jdbc_execute(
+        spark,
+        args.jdbc_url,
+        props,
+        "DROP TABLE IF EXISTS dim_location_stage; DROP TABLE IF EXISTS dim_time_stage",
     )
 
     print("[load_to_warehouse] done.", flush=True)

@@ -1,23 +1,19 @@
 """End-to-end weather pipeline DAG.
 
-Runs the full chain:
+Runs the full chain (diamond joining at `predict_all_cells`):
 
-    ingest_archive → bronze_to_silver → silver_to_gold
-                                          → load_warehouse → backfill_actuals
-                                          → train_model
+    ingest_archive → bronze_to_silver → silver_to_gold ┬→ load_warehouse ─┐
+                                                        └→ train_model ────┴→ predict_all_cells → backfill_actuals
 
 Daily run: additively ingests the last 30 days of *archive* (real observations)
-from Open-Meteo, rebuilds silver/gold/warehouse, fills in actuals for any
-predictions whose target_time now has an observation, then retrains.
+from Open-Meteo, rebuilds silver/gold/warehouse (upserting dims),
+re-trains the LSTM, generates one fresh forecast per grid cell, then
+backfills actuals onto any predictions whose target_time now has an
+observation. The user never has to click anything — the dashboard is
+read-only.
 
 Manual trigger: pass `conf={"start_date": "...", "end_date": "...", "force": false}`
-to backfill a custom range. The Streamlit dashboard (Phase 2c) calls this DAG
-via the Airflow REST API with custom conf.
-
-Phase 2a: switched from `--forecast` (Open-Meteo's own model output) to
-`--backfill` against the archive endpoint — bronze now means real observations.
-Phase 2b: added `backfill_actuals` so historical predictions get their truth
-values filled in once the corresponding observations land.
+to backfill a custom range.
 
 Run/inspect from http://localhost:8081 (admin/admin).
 """
@@ -50,7 +46,7 @@ S3_ENV = (
 )
 
 # Postgres env for the Python tasks that touch the warehouse directly
-# (warehouse.actuals_backfill, ml.train model registry).
+# (warehouse.actuals_backfill, ml.predict_all).
 WAREHOUSE_ENV = (
     "POSTGRES_HOST=postgres "
     "POSTGRES_PORT=5432 "
@@ -136,24 +132,14 @@ with DAG(
         bash_command=f"{SPARK_SUBMIT} /opt/jobs/silver_to_gold.py",
     )
 
-    # TRUNCATE + INSERT into fact + dims via JDBC.
+    # Upsert dims + TRUNCATE+INSERT fact via JDBC.
     load_warehouse = BashOperator(
         task_id="load_warehouse",
         bash_command=f"{SPARK_SUBMIT} /opt/jobs/load_to_warehouse.py",
     )
 
-    # Phase 2b: fill predictions.actual_value where the corresponding
-    # observation just landed in fact_weather_observations.
-    backfill_actuals = BashOperator(
-        task_id="backfill_actuals",
-        bash_command=(
-            f"cd {PROJECT_DIR} && {WAREHOUSE_ENV} python -m warehouse.actuals_backfill"
-        ),
-    )
-
     # Retrain the LSTM against the freshly-rebuilt gold table.
     # Reads gold straight from MinIO via the s3:// path support in ml.dataset.
-    # Registers the new model in the Postgres `models` table.
     train_model = BashOperator(
         task_id="train_model",
         bash_command=(
@@ -165,6 +151,29 @@ with DAG(
         ),
     )
 
+    # Auto-generate one fresh forecast per grid cell with the new model.
+    # Needs both a trained checkpoint AND dim_location populated in Postgres.
+    predict_all_cells = BashOperator(
+        task_id="predict_all_cells",
+        bash_command=(
+            f"cd {PROJECT_DIR} && "
+            f"{S3_ENV} {WAREHOUSE_ENV} python -m ml.predict_all "
+            "--checkpoint checkpoints/best.pt "
+            "--gold s3://weather-lake/gold/weather_features"
+        ),
+    )
+
+    # Fill predictions.actual_value where the corresponding observation
+    # just landed in fact_weather_observations (runs last so it sees the
+    # freshly inserted forecasts too).
+    backfill_actuals = BashOperator(
+        task_id="backfill_actuals",
+        bash_command=(
+            f"cd {PROJECT_DIR} && {WAREHOUSE_ENV} python -m warehouse.actuals_backfill"
+        ),
+    )
+
     ingest_archive >> bronze_to_silver >> silver_to_gold
-    silver_to_gold >> load_warehouse >> backfill_actuals
+    silver_to_gold >> load_warehouse
     silver_to_gold >> train_model
+    [load_warehouse, train_model] >> predict_all_cells >> backfill_actuals

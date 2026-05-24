@@ -13,10 +13,10 @@ Reads gold parquet directly from MinIO via pyarrow's S3FileSystem (Phase
 S3_SECRET_KEY in `.env` to point at your MinIO instance.
 
 Train/val split is time-based (no leakage). Checkpoints land in
-`checkpoints/<ISO_timestamp>.pt`; the lowest-val-MSE run is also copied
-to `checkpoints/best.pt` so the predictor has a stable pointer. Each
-training run records a row in the Postgres `models` table (Phase 2b) so
-the dashboard can detect "model trained on stale gold range."
+`checkpoints/<ISO_timestamp>.pt` and are also copied to
+`checkpoints/best.pt`, which is the single source of model identity for
+the rest of the project (dashboard reads provenance from the checkpoint
+dict; no Postgres registry).
 """
 
 from __future__ import annotations
@@ -24,7 +24,6 @@ from __future__ import annotations
 import argparse
 import json
 import shutil
-import sys
 from dataclasses import asdict
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -124,30 +123,6 @@ def validate_resume_checkpoint(
     )
 
 
-def _safe_register_model(**kwargs) -> bool:
-    """Insert a row into the `models` table. Returns True on success.
-
-    DB unreachable / table missing is non-fatal: training succeeded and the
-    checkpoint is on disk, so we just warn and move on.
-    """
-    try:
-        from warehouse.client import connect_from_env, register_model, transaction
-    except Exception as exc:
-        print(f"[train] warehouse.client import failed: {exc}", file=sys.stderr)
-        return False
-    try:
-        conn = connect_from_env()
-        try:
-            with transaction(conn):
-                register_model(conn, **kwargs)
-        finally:
-            conn.close()
-        return True
-    except Exception as exc:
-        print(f"[train] model registry update failed: {exc}", file=sys.stderr)
-        return False
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train weather LSTM on gold parquet.")
     parser.add_argument("--gold", required=True, help="s3:// URI of the gold parquet.")
@@ -178,11 +153,6 @@ def main() -> None:
         default=0,
         help="When --resume is given, train this many additional epochs (on top "
         "of the checkpoint's recorded epoch count). Ignored otherwise.",
-    )
-    parser.add_argument(
-        "--no-register",
-        action="store_true",
-        help="Skip writing a row to the Postgres `models` table.",
     )
     args = parser.parse_args()
 
@@ -348,21 +318,6 @@ def main() -> None:
     plot_loss_curves(records, plot_path)
     log.info(f"training log saved to {csv_log_path}")
     log.info(f"loss curves saved to {plot_path}")
-
-    if not args.no_register:
-        ok = _safe_register_model(
-            model_version=model_version,
-            trained_at=trained_at,
-            data_range_start=data_range_start,
-            data_range_end=data_range_end,
-            gold_row_count=int(len(gold)),
-            best_val_mse=best_val,
-            epochs=target_epoch,
-            checkpoint_path=str(versioned_path),
-            hyperparams=hyperparams,
-            notes=(f"resumed from {resumed_from}" if resumed_from else None),
-        )
-        log.info(f"model registry: {'updated' if ok else 'skipped'}")
 
 
 if __name__ == "__main__":

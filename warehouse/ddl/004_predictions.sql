@@ -10,7 +10,7 @@
 CREATE TABLE IF NOT EXISTS predictions (
     id                  BIGSERIAL          PRIMARY KEY,
     model_version       TEXT               NOT NULL,
-    location_id         INTEGER            NOT NULL REFERENCES dim_location (location_id),
+    location_id         INTEGER            NOT NULL REFERENCES dim_location (location_id) ON DELETE RESTRICT,
     prediction_made_at  TIMESTAMPTZ        NOT NULL,
     target_time         TIMESTAMPTZ        NOT NULL,
     predicted_value     DOUBLE PRECISION   NOT NULL,

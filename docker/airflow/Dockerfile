@@ -15,8 +15,12 @@ RUN apt-get update \
 
 USER airflow
 
-# Install CPU torch via the dedicated index so it doesn't grab the (huge) CUDA wheel.
-RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+# CUDA 12.8 torch wheel — matches the host's GPU (RTX 50-series + NVIDIA
+# Container Toolkit). The scheduler service in docker-compose.yml requests
+# GPU access via deploy.resources so this wheel actually has a device to
+# run on; without that passthrough torch.cuda.is_available() returns False
+# and training silently falls back to CPU.
+RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cu128
 
 COPY requirements-airflow.txt /tmp/requirements-airflow.txt
 RUN pip install --no-cache-dir -r /tmp/requirements-airflow.txt

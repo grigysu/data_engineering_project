@@ -272,7 +272,12 @@ docker compose up -d dashboard
 start http://localhost:8501
 ```
 
-(Or run natively with `streamlit run dashboard/app.py --server.port 8501` from an activated venv — useful for development.)
+Or run natively from an activated venv. Streamlit only adds the script's own directory to `sys.path`, so the repo root needs to be on `PYTHONPATH` for `from dashboard.state import …` to resolve:
+
+```powershell
+$env:PYTHONPATH = $PWD
+streamlit run dashboard/app.py --server.port 8501
+```
 
 ### Pages
 
