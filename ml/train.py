@@ -30,7 +30,12 @@ from ml.dataset import (
     load_gold,
     time_based_split,
 )
-from ml.logging_utils import EpochRecord, plot_loss_curves, write_training_log
+from ml.logging_utils import (
+    EpochRecord,
+    plot_loss_curves,
+    setup_logger,
+    write_training_log,
+)
 from ml.models.lstm import WeatherLSTM
 
 
@@ -93,10 +98,19 @@ def main() -> None:
     np.random.seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    print(f"[train] device={device}  loading gold from {args.gold}")
+    ckpt_path = Path(args.checkpoint)
+    log = setup_logger("train", ckpt_path.parent / "train.log")
+
+    log.info(f"device={device}  loading gold from {args.gold}")
+    if device.type == "cuda":
+        log.info(
+            f"cuda: {torch.cuda.get_device_name(0)} "
+            f"(capability {torch.cuda.get_device_capability(0)}, "
+            f"torch={torch.__version__}, cuda_runtime={torch.version.cuda})"
+        )
     gold = load_gold(args.gold)
     n_locations = gold.groupby(["lat", "lon"]).ngroups
-    print(f"[train] {len(gold):,} gold rows; {n_locations} unique locations")
+    log.info(f"{len(gold):,} gold rows; {n_locations} unique locations")
 
     spec = WindowSpec(seq_in=args.seq_in, seq_out=args.seq_out)
     X, y, anchors = build_window_set(gold, spec)
@@ -106,7 +120,7 @@ def main() -> None:
             f"seq_in={args.seq_in}+seq_out={args.seq_out}. Need more gold data."
         )
     Xtr, ytr, Xva, yva = time_based_split(X, y, anchors, val_fraction=args.val_fraction)
-    print(f"[train] windows: train={len(Xtr)}  val={len(Xva)}")
+    log.info(f"windows: train={len(Xtr)}  val={len(Xva)}")
     if len(Xva) == 0:
         raise SystemExit(
             "[train] zero validation windows — pick a smaller --val-fraction."
@@ -129,11 +143,10 @@ def main() -> None:
     loss_fn = torch.nn.MSELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
-    ckpt_path = Path(args.checkpoint)
     ckpt_path.parent.mkdir(parents=True, exist_ok=True)
     best_val = float("inf")
     records: list[EpochRecord] = []
-    print("[train] epoch  train_mse  val_mse")
+    log.info("epoch  train_mse  val_mse")
     for epoch in range(1, args.epochs + 1):
         tr_loss = train_epoch(model, train_loader, loss_fn, optimizer, device)
         va_loss = eval_epoch(model, val_loader, loss_fn, device)
@@ -160,22 +173,22 @@ def main() -> None:
             )
         )
         marker = "  <- best" if is_best else ""
-        print(f"[train] {epoch:>5d}  {tr_loss:9.4f}  {va_loss:7.4f}{marker}")
+        log.info(f"{epoch:>5d}  {tr_loss:9.4f}  {va_loss:7.4f}{marker}")
 
-    print(f"[train] best val MSE: {best_val:.4f}")
-    print(f"[train] checkpoint saved to {ckpt_path}")
+    log.info(f"best val MSE: {best_val:.4f}")
+    log.info(f"checkpoint saved to {ckpt_path}")
 
     metrics = {"best_val_mse": best_val, "epochs": args.epochs}
     metrics_path = ckpt_path.with_suffix(".metrics.json")
     metrics_path.write_text(json.dumps(metrics, indent=2))
-    print(f"[train] metrics saved to {metrics_path}")
+    log.info(f"metrics saved to {metrics_path}")
 
-    log_path = ckpt_path.parent / "training_log.csv"
+    csv_log_path = ckpt_path.parent / "training_log.csv"
     plot_path = ckpt_path.parent / "loss_curves.png"
-    write_training_log(log_path, records)
+    write_training_log(csv_log_path, records)
     plot_loss_curves(records, plot_path)
-    print(f"[train] training log saved to {log_path}")
-    print(f"[train] loss curves saved to {plot_path}")
+    log.info(f"training log saved to {csv_log_path}")
+    log.info(f"loss curves saved to {plot_path}")
 
 
 if __name__ == "__main__":

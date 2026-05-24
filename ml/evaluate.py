@@ -25,6 +25,7 @@ from ml.dataset import (
 from ml.logging_utils import (
     plot_per_horizon_error,
     plot_predictions_vs_actual,
+    setup_logger,
     write_per_horizon_csv,
 )
 from ml.models.lstm import WeatherLSTM
@@ -71,7 +72,10 @@ def main() -> None:
     spec = WindowSpec(**ckpt["spec"])
     hp = ckpt["hyperparams"]
 
-    print(f"[eval] loading gold from {args.gold}")
+    out_dir = Path(args.checkpoint).parent
+    log = setup_logger("eval", out_dir / "eval.log")
+
+    log.info(f"device={device}  loading gold from {args.gold}")
     gold = load_gold(args.gold)
     X, y, anchors = build_window_set(gold, spec, feature_cols=feature_cols)
     _, _, Xva, yva = time_based_split(X, y, anchors, val_fraction=args.val_fraction)
@@ -90,22 +94,22 @@ def main() -> None:
     model.load_state_dict(ckpt["model_state"])
 
     pred, true = collect_predictions(model, val_loader, device)
-    print(f"[eval] {len(pred)} hold-out windows, seq_out={spec.seq_out}")
+    log.info(f"{len(pred)} hold-out windows, seq_out={spec.seq_out}")
 
-    print("\nPooled across all horizons:")
-    print(f"  MAE  = {_mae(pred, true):6.3f} °C")
-    print(f"  RMSE = {_rmse(pred, true):6.3f} °C")
-    print(f"  MAPE = {_mape(pred, true):6.2f} %")
+    log.info("Pooled across all horizons:")
+    log.info(f"  MAE  = {_mae(pred, true):6.3f} °C")
+    log.info(f"  RMSE = {_rmse(pred, true):6.3f} °C")
+    log.info(f"  MAPE = {_mape(pred, true):6.2f} %")
 
     horizons = list(range(1, spec.seq_out + 1))
     per_h_mae = [_mae(pred[:, h], true[:, h]) for h in range(spec.seq_out)]
     per_h_rmse = [_rmse(pred[:, h], true[:, h]) for h in range(spec.seq_out)]
     per_h_mape = [_mape(pred[:, h], true[:, h]) for h in range(spec.seq_out)]
 
-    print("\nPer-horizon (hours ahead):")
-    print("  h+  MAE  RMSE  MAPE%")
+    log.info("Per-horizon (hours ahead):")
+    log.info("  h+  MAE  RMSE  MAPE%")
     for h, m, r, p in zip(horizons, per_h_mae, per_h_rmse, per_h_mape):
-        print(f"  {h:>2d}  {m:5.2f} {r:5.2f} {p:5.1f}")
+        log.info(f"  {h:>2d}  {m:5.2f} {r:5.2f} {p:5.1f}")
 
     # Persistence baseline: "next L_out values = last observed value".
     # Xva is the *un-normalized* raw window array (normalization happens
@@ -116,12 +120,10 @@ def main() -> None:
     last_obs = Xva[:, -1, target_idx]
     persistence = np.broadcast_to(last_obs[:, None], yva.shape)
     persistence_mae = _mae(persistence, yva)
-    print("\nPersistence baseline (last-observed-value):")
-    print(f"  MAE  = {persistence_mae:6.3f} °C")
-    print(f"  RMSE = {_rmse(persistence, yva):6.3f} °C")
+    log.info("Persistence baseline (last-observed-value):")
+    log.info(f"  MAE  = {persistence_mae:6.3f} °C")
+    log.info(f"  RMSE = {_rmse(persistence, yva):6.3f} °C")
 
-    out_dir = Path(args.checkpoint).parent
-    out_dir.mkdir(parents=True, exist_ok=True)
     csv_path = out_dir / "per_horizon_metrics.csv"
     horizon_plot = out_dir / "per_horizon_error.png"
     preds_plot = out_dir / "predictions_vs_actual.png"
@@ -130,9 +132,9 @@ def main() -> None:
         horizons, per_h_mae, per_h_rmse, persistence_mae, horizon_plot
     )
     plot_predictions_vs_actual(pred, true, preds_plot, n_samples=6)
-    print(f"\n[eval] per-horizon CSV : {csv_path}")
-    print(f"[eval] per-horizon plot: {horizon_plot}")
-    print(f"[eval] preds-vs-actual : {preds_plot}")
+    log.info(f"per-horizon CSV : {csv_path}")
+    log.info(f"per-horizon plot: {horizon_plot}")
+    log.info(f"preds-vs-actual : {preds_plot}")
 
 
 if __name__ == "__main__":

@@ -1,4 +1,5 @@
-"""Lightweight training/eval artifacts: CSV logs + matplotlib plots.
+"""Lightweight training/eval artifacts: CSV logs + matplotlib plots
++ a stdout/file logger so runs leave a permanent text trail.
 
 Kept separate from train.py / evaluate.py so the training code stays
 focused on training, and so the plotting can be unit-tested in isolation
@@ -8,6 +9,8 @@ if needed.
 from __future__ import annotations
 
 import csv
+import logging
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -17,6 +20,30 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
+
+
+def setup_logger(name: str, log_path: Path) -> logging.Logger:
+    """Logger that writes to both stdout and `log_path` (mode='w', UTF-8).
+
+    Idempotent: re-calling with the same name clears prior handlers, so
+    re-running train.py in the same process (e.g. from a notebook) doesn't
+    duplicate every log line.
+    """
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    logger = logging.getLogger(name)
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()
+    logger.propagate = False
+    fmt = logging.Formatter(
+        fmt="%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S"
+    )
+    stream = logging.StreamHandler(sys.stdout)
+    stream.setFormatter(fmt)
+    file = logging.FileHandler(log_path, mode="w", encoding="utf-8")
+    file.setFormatter(fmt)
+    logger.addHandler(stream)
+    logger.addHandler(file)
+    return logger
 
 
 @dataclass
