@@ -1,160 +1,111 @@
 # Weather Data Pipeline + ML Forecasting
 
-End-to-end data engineering + ML system for weather forecasting over **Armenia** (10×10 lat/lon grid). Built as a portfolio-grade showcase of the modern data stack: object-store data lake, PySpark ETL, Hive-cataloged SQL access, dimensional warehouse, PyTorch sequence models, and Airflow orchestration.
+End-to-end data engineering + ML system that pulls weather data for **Armenia** (10×10 lat/lon grid), runs it through a Bronze→Silver→Gold lake with PySpark, lands it in a Postgres star schema, trains a PyTorch LSTM, serves predictions over HTTP, and orchestrates the whole thing with Airflow.
+
+Built as a portfolio piece showing the full modern data stack glued together on one laptop.
+
+---
+
+## Documentation map
+
+| Doc | Read when… |
+|---|---|
+| **[docs/PROGRESS.md](docs/PROGRESS.md)** | You're an ML engineer who wants a guided tour of what each layer is and *why* it exists. |
+| **[docs/USAGE.md](docs/USAGE.md)** | You want to actually run things — every command, every CLI flag, common workflows, troubleshooting. |
+| **[docs/WIKI.md](docs/WIKI.md)** | You're looking something up — env vars, ports, schemas, services, file layout. |
+
+If you read only one section of any doc, read the [big picture](docs/PROGRESS.md#the-big-picture) in PROGRESS.
+
+---
 
 ## Architecture
 
 ```
                 ┌─────────────────────────────────────────────────────┐
-                │                    Airflow DAG                      │
-                │  ingest → bronze → silver → gold → train → deploy   │
+                │                    Airflow DAG (:8081)              │
+                │  ingest → bronze → silver → gold → warehouse → train│
                 └─────────────────────────────────────────────────────┘
                                        │
    ┌───────────┐    ┌─────────────┐    │    ┌──────────────┐    ┌──────────────┐
    │ Open-Meteo│ →  │  Ingestion  │ →  │ →  │   PySpark    │ →  │  Postgres    │
-   │  (free)   │    │  (Python)   │    │    │   ETL +      │    │  (Gold star  │
-   └───────────┘    └─────────────┘    │    │   features   │    │   schema)    │
-                          │            │    └──────────────┘    └──────────────┘
-                          ▼            │           │                    │
-                  ┌─────────────────┐  │           │                    ▼
-                  │  MinIO (S3 API) │  │           │            ┌──────────────┐
-                  │  bronze/        │  │           │            │   PyTorch    │
-                  │  silver/        │◀─┘           │            │   training   │
-                  │  gold/          │              │            │  (LSTM/Tx)   │
-                  └─────────────────┘              │            └──────────────┘
-                          │                        │                    │
-                          ▼                        ▼                    ▼
-                  ┌─────────────────────────────────────┐       ┌──────────────┐
-                  │ Hive Metastore + Spark Thrift Server│       │  FastAPI     │
-                  │  (SQL-on-Parquet, JDBC/BI access)   │       │  inference   │
-                  └─────────────────────────────────────┘       └──────────────┘
+   │  (free)   │    │  (Python)   │    │    │   ETL +      │    │  star schema │
+   └───────────┘    └─────────────┘    │    │   features   │    └──────────────┘
+                          │            │    └──────────────┘            │
+                          ▼            │           │                    ▼
+                  ┌─────────────────┐  │           │           ┌──────────────┐
+                  │  MinIO (:9000)  │  │           │           │ PyTorch LSTM │
+                  │  bronze/silver/ │◀─┘           │           │   training   │
+                  │  gold/          │              │           └──────────────┘
+                  └─────────────────┘              │                    │
+                          │                        ▼                    ▼
+                          ▼               ┌────────────────────┐  ┌──────────────┐
+                  ┌────────────────────┐  │ Hive Metastore     │  │  FastAPI     │
+                  │ Spark SQL via      │──┤  (:9083) catalog   │  │  /forecast   │
+                  │ external tables    │  └────────────────────┘  │   (:8000)    │
+                  └────────────────────┘                          └──────────────┘
 ```
 
-## Stack
+## Status
 
-| Layer            | Tool                                                |
-|------------------|-----------------------------------------------------|
-| Data source      | Open-Meteo (free, no API key, hourly historical + forecast) |
-| Ingestion        | Python + httpx + pydantic                           |
-| Object store     | MinIO (S3-compatible, local)                        |
-| Lake format      | Parquet, medallion layout (bronze / silver / gold)  |
-| ETL              | PySpark (single-node, in Docker)                    |
-| SQL catalog      | Hive Metastore + Spark Thrift Server                |
-| Warehouse        | PostgreSQL — star schema                            |
-| ML               | PyTorch (LSTM baseline, Transformer stretch)        |
-| Inference        | FastAPI                                             |
-| Orchestration    | Airflow (LocalExecutor, in Docker)                  |
+All 7 build phases complete and verified end-to-end:
 
-## Repository Layout
+| Phase | Slice | Status |
+|---|---|---|
+| 0 | Scaffolding | ✅ |
+| 1 | Ingestion → MinIO bronze + healthcheck preflight | ✅ |
+| 2a | Spark medallion ETL (bronze → silver → gold) | ✅ |
+| 2b | Hive Metastore + SQL access via `spark-sql` | ✅ |
+| 3 | Postgres star schema (`fact_weather_observations`, `dim_location`, `dim_time`) | ✅ |
+| 4 | PyTorch LSTM training + CSV logs + matplotlib plots + GPU (CUDA) | ✅ |
+| 5 | FastAPI inference (`/health`, `/grid_points`, `/forecast`) | ✅ |
+| 6 | Airflow DAG runs the whole pipeline (`@daily`, manual-triggerable) | ✅ |
 
-```
-data_engine/
-├── docker-compose.yml          # Phase 1: minio + postgres. Later phases add spark/hive/airflow.
-├── .env.example                # Copy to .env and adjust
-├── requirements.txt            # Native venv dependencies
-│
-├── ingestion/                  # Python jobs that pull Open-Meteo data → bronze
-│   ├── grid.py                 # Armenia 10x10 grid generation (implemented)
-│   ├── openmeteo_client.py     # async HTTP client            (Phase 1)
-│   ├── schemas.py              # pydantic models               (Phase 1)
-│   └── run_ingest.py           # CLI entrypoint                (Phase 1)
-│
-├── spark_jobs/                 # PySpark ETL — runs inside the Spark container
-│   ├── bronze_to_silver.py     # parse, dedupe, type-cast      (Phase 2)
-│   ├── silver_to_gold.py       # feature engineering           (Phase 2)
-│   ├── build_training_set.py   # window into ML sequences      (Phase 2)
-│   └── load_to_warehouse.py    # Spark → Postgres via JDBC     (Phase 3)
-│
-├── warehouse/
-│   ├── ddl/                    # Postgres star-schema DDL      (Phase 3)
-│   └── hive/                   # External-table DDL for Spark SQL (Phase 2)
-│
-├── ml/
-│   ├── dataset.py              # PyTorch Dataset over gold parquet (Phase 4)
-│   ├── models/                 # lstm.py, transformer.py        (Phase 4)
-│   ├── train.py                # train loop, checkpointing      (Phase 4)
-│   └── evaluate.py             # backtest                       (Phase 4)
-│
-├── serving/
-│   ├── api.py                  # FastAPI app                    (Phase 5)
-│   └── predictor.py            # load checkpoint + featurize    (Phase 5)
-│
-├── airflow/
-│   └── dags/weather_pipeline.py  # end-to-end DAG               (Phase 6)
-│
-├── docker/
-│   └── postgres-init/          # SQL files auto-run on container boot
-│
-└── tests/
-```
+**Tests:** 26 passing (ingestion, healthcheck, dataset windowing, predictor, API).
+**Lint/format:** ruff clean across 28 files.
 
-## Local Setup (Windows)
-
-### 1. Python venv
+## Quickstart (≈ 5 minutes once Docker is warm)
 
 ```powershell
+# 1. Native venv (Phase 1 ingestion + Phase 4/5 ML+serving run here)
 py -3 -m venv .venv
-.\.venv\Scripts\Activate.ps1
+. .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-```
+# Optional: GPU torch (Blackwell needs cu128+, see docs/WIKI.md#gpu)
+pip install torch --index-url https://download.pytorch.org/whl/cu128
 
-### 2. Environment
-
-```powershell
+# 2. Config
 Copy-Item .env.example .env
-# Edit .env if you want non-default passwords / endpoints
-```
 
-### 3. Docker Desktop
-
-Make sure Docker Desktop is **running** (whale icon steady in the system tray). Sign-in is not required. Then in a fresh PowerShell:
-
-```powershell
+# 3. Bring up the full stack (~3 GB of images on first pull)
 docker compose up -d
+
+# 4. One-time: register Hive external tables over the existing parquet
+docker cp warehouse/hive/create_external_tables.sql weather_spark_master:/tmp/
+docker exec weather_spark_master /opt/spark/bin/spark-sql `
+  --master spark://spark-master:7077 -f /tmp/create_external_tables.sql
+
+# 5. Pull data, transform, train, serve, orchestrate — see docs/USAGE.md
+python -m ingestion.run_ingest --forecast --forecast-days 7
+docker exec weather_spark_master /opt/spark/bin/spark-submit `
+  --master spark://spark-master:7077 /opt/jobs/bronze_to_silver.py
+# ... continues in docs/USAGE.md
 ```
 
-This brings up MinIO (S3 API on `:9000`, console on `:9001`) and Postgres (`:5432`). The bootstrap container creates the `weather-lake` bucket with `bronze/`, `silver/`, `gold/` prefixes.
+## UIs (after `docker compose up -d`)
 
-- MinIO console: http://localhost:9001 (login: `minioadmin` / `minioadmin`)
-- Postgres: `psql -h localhost -U weather -d weather_dw`
+| URL | Service | Login |
+|---|---|---|
+| http://localhost:9001 | MinIO console | `minioadmin` / `minioadmin` |
+| http://localhost:8080 | Spark master | — |
+| http://localhost:8081 | Airflow web UI | `admin` / `admin` |
+| http://localhost:8000/docs | FastAPI (when running) | — |
 
-## Region
+## Honest caveats
 
-Default region is **Armenia**, bounding box `(38.84°N, 43.45°E) → (41.30°N, 46.63°E)`, generated as a 10×10 grid = 100 points. Adjust via env vars in `.env`:
+- **7–14 day weather forecasts from observations alone are hard.** Real operational forecasts use NWP (numerical weather prediction) simulators. An LSTM trained on a few months of observations will underperform Open-Meteo's own forecast at long horizons. The value here is the end-to-end *pipeline*, not the model.
+- **Currently undertrained.** Open-Meteo's archive endpoint has been returning persistent 504s; we only have ~3 days of forecast data in bronze (≈ 288 silver rows, 60 training windows). The LSTM has learned the global mean and loses to a persistence baseline. Pipeline is correct, data volume is the bottleneck. See `predictions_vs_actual.png` for the visible failure mode.
+- **Windows + Spark natively is painful** (winutils, Hadoop config). Spark / Hive / Airflow / Postgres / MinIO all run in Docker; only the dev/ingestion/ML code runs in the native venv.
 
-```
-GRID_LAT_MIN=...
-GRID_LAT_MAX=...
-GRID_LON_MIN=...
-GRID_LON_MAX=...
-GRID_SIZE=10
-```
+## Future enhancements (explicitly deferred)
 
-Preview the grid:
-
-```powershell
-python -m ingestion.grid
-```
-
-## Build Phases
-
-| Phase | Working slice                                          | Status |
-|-------|--------------------------------------------------------|--------|
-| 0     | Repo scaffolding (this commit)                         | ✅     |
-| 1     | Ingestion writes bronze Parquet to MinIO               | ⏳     |
-| 2     | Spark ETL + Hive-cataloged silver/gold tables          | ⏳     |
-| 3     | Postgres star schema populated from gold               | ⏳     |
-| 4     | PyTorch model trained, checkpoint on disk              | ⏳     |
-| 5     | FastAPI `/forecast` endpoint live                      | ⏳     |
-| 6     | Airflow DAG runs the whole pipeline end-to-end         | ⏳     |
-
-See the [project plan](../../.claude/plans/this-is-my-project-snazzy-hammock.md) for details on each phase.
-
-## Honest Caveats
-
-- **7–14 day forecasts from observations alone are hard.** Operational weather forecasts use NWP (numerical weather prediction) models. This project's ML model will likely underperform Open-Meteo's own NWP-based forecast at long horizons — that's expected; the value is the end-to-end pipeline, not state-of-the-art meteorology.
-- **Windows + Spark natively is painful** (winutils, Hadoop config). The Spark/Hive services run in Docker; only the dev/ingestion/ML code runs in the native venv.
-
-## Future Enhancements (deferred)
-
-Delta Lake / Iceberg, MLflow experiment tracking, Kafka streaming ingestion, distributed Spark cluster, cloud port (MinIO → S3, Postgres → Snowflake/BigQuery, Airflow → MWAA).
+Delta Lake / Iceberg, MLflow experiment tracking, Kafka streaming ingestion, distributed Spark cluster, cloud port (MinIO → S3, Postgres → Snowflake/BigQuery, Airflow → MWAA), Transformer model variant.
