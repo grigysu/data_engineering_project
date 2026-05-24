@@ -168,6 +168,68 @@ services:
     depends_on:
       - spark-master
 
+  # ---------- Airflow (Phase 6) ----------
+  # Built from docker/airflow/Dockerfile — extends apache/airflow:2.10 with
+  # our runtime deps (ingestion + ML) and the docker CLI so BashOperators
+  # can `docker exec` into spark-master for spark-submit tasks.
+  airflow_init:
+    build: ./docker/airflow
+    image: weather_airflow:latest
+    container_name: weather_airflow_init
+    user: "0:0"
+    environment: &airflow-env
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow_db
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
+      AIRFLOW__CORE__FERNET_KEY: ""    # auto-generated each run is fine for local dev
+      AIRFLOW__WEBSERVER__SECRET_KEY: "weather-dev-secret-not-for-prod"
+      AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "true"
+      AIRFLOW_UID: "0"
+    entrypoint: ["/bin/bash", "-c"]
+    # Array form so the whole string is a single argv[1] to bash -c, not
+    # space-split. The ';' after users-create makes the "user already
+    # exists" exit-code non-fatal on reruns.
+    command:
+      - "airflow db migrate && airflow users create --username admin --password admin --firstname Admin --lastname User --role Admin --email admin@local ; echo 'airflow init complete.'"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  airflow_webserver:
+    build: ./docker/airflow
+    image: weather_airflow:latest
+    container_name: weather_airflow_webserver
+    user: "0:0"
+    command: webserver
+    environment: *airflow-env
+    ports:
+      - "8081:8080"   # :8080 is taken by Spark master UI
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags:ro
+      - ./airflow/logs:/opt/airflow/logs
+      - .:/opt/weather               # project code, for Python tasks (ingestion + ml.train)
+      - /var/run/docker.sock:/var/run/docker.sock   # so BashOperator can `docker exec` spark-master
+    depends_on:
+      airflow_init:
+        condition: service_completed_successfully
+
+  airflow_scheduler:
+    build: ./docker/airflow
+    image: weather_airflow:latest
+    container_name: weather_airflow_scheduler
+    user: "0:0"
+    command: scheduler
+    environment: *airflow-env
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags:ro
+      - ./airflow/logs:/opt/airflow/logs
+      - .:/opt/weather
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      airflow_init:
+        condition: service_completed_successfully
+
 volumes:
   minio_data:
   postgres_data:

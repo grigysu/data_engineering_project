@@ -11,12 +11,14 @@ sliced — no random shuffling that would leak the future into the past.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import pyarrow.dataset as pads
+import pyarrow.fs as pafs
 import torch
 from torch.utils.data import Dataset
 
@@ -55,12 +57,33 @@ class WindowSpec:
 
 
 def load_gold(path: str | Path) -> pd.DataFrame:
-    """Read the gold parquet (any partition layout) into a pandas DataFrame.
+    """Read the gold parquet into a pandas DataFrame.
 
-    Path can be a local directory, a single .parquet file, or anything
-    pyarrow's Dataset abstraction can open.
+    Path can be:
+      - a local directory or .parquet file (anything pyarrow can open), or
+      - an s3://... URI; MinIO/S3 config comes from S3_ENDPOINT,
+        S3_ACCESS_KEY, S3_SECRET_KEY env vars (defaults match the local
+        MinIO from docker-compose).
     """
-    df = pads.dataset(str(path), format="parquet").to_table().to_pandas()
+    path_str = str(path)
+    if path_str.startswith("s3://"):
+        endpoint = os.getenv("S3_ENDPOINT", "http://minio:9000")
+        scheme = "https" if endpoint.startswith("https://") else "http"
+        host_port = endpoint.split("://", 1)[1]
+        fs = pafs.S3FileSystem(
+            endpoint_override=host_port,
+            access_key=os.getenv("S3_ACCESS_KEY", "minioadmin"),
+            secret_key=os.getenv("S3_SECRET_KEY", "minioadmin"),
+            scheme=scheme,
+        )
+        bucket_path = path_str[len("s3://") :]
+        df = (
+            pads.dataset(bucket_path, format="parquet", filesystem=fs)
+            .to_table()
+            .to_pandas()
+        )
+    else:
+        df = pads.dataset(path_str, format="parquet").to_table().to_pandas()
     return df.sort_values(["lat", "lon", "observed_at"]).reset_index(drop=True)
 
 
