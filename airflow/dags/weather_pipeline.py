@@ -3,11 +3,12 @@
 Runs the full chain:
 
     ingest_archive → bronze_to_silver → silver_to_gold
-                                          → load_warehouse
+                                          → load_warehouse → backfill_actuals
                                           → train_model
 
 Daily run: additively ingests the last 30 days of *archive* (real observations)
-from Open-Meteo, then re-builds silver/gold/warehouse and retrains.
+from Open-Meteo, rebuilds silver/gold/warehouse, fills in actuals for any
+predictions whose target_time now has an observation, then retrains.
 
 Manual trigger: pass `conf={"start_date": "...", "end_date": "...", "force": false}`
 to backfill a custom range. The Streamlit dashboard (Phase 2c) calls this DAG
@@ -15,8 +16,8 @@ via the Airflow REST API with custom conf.
 
 Phase 2a: switched from `--forecast` (Open-Meteo's own model output) to
 `--backfill` against the archive endpoint — bronze now means real observations.
-Ingest is additive (gold-coverage manifest), so daily runs are cheap once the
-backfill has caught up.
+Phase 2b: added `backfill_actuals` so historical predictions get their truth
+values filled in once the corresponding observations land.
 
 Run/inspect from http://localhost:8081 (admin/admin).
 """
@@ -46,6 +47,16 @@ S3_ENV = (
     "REGION_NAME=armenia "
     "GRID_LAT_MIN=38.84 GRID_LAT_MAX=41.30 "
     "GRID_LON_MIN=43.45 GRID_LON_MAX=46.63 GRID_SIZE=10"
+)
+
+# Postgres env for the Python tasks that touch the warehouse directly
+# (warehouse.actuals_backfill, ml.train model registry).
+WAREHOUSE_ENV = (
+    "POSTGRES_HOST=postgres "
+    "POSTGRES_PORT=5432 "
+    "POSTGRES_DB=weather_dw "
+    "POSTGRES_USER=weather "
+    "POSTGRES_PASSWORD=weather"
 )
 
 # Spark submit invoked via the host docker daemon (socket is mounted in).
@@ -131,18 +142,29 @@ with DAG(
         bash_command=f"{SPARK_SUBMIT} /opt/jobs/load_to_warehouse.py",
     )
 
+    # Phase 2b: fill predictions.actual_value where the corresponding
+    # observation just landed in fact_weather_observations.
+    backfill_actuals = BashOperator(
+        task_id="backfill_actuals",
+        bash_command=(
+            f"cd {PROJECT_DIR} && {WAREHOUSE_ENV} python -m warehouse.actuals_backfill"
+        ),
+    )
+
     # Retrain the LSTM against the freshly-rebuilt gold table.
     # Reads gold straight from MinIO via the s3:// path support in ml.dataset.
+    # Registers the new model in the Postgres `models` table.
     train_model = BashOperator(
         task_id="train_model",
         bash_command=(
             f"cd {PROJECT_DIR} && "
-            f"{S3_ENV} python -m ml.train "
+            f"{S3_ENV} {WAREHOUSE_ENV} python -m ml.train "
             "--gold s3://weather-lake/gold/weather_features "
             "--epochs 20 --batch-size 16 "
-            "--checkpoint checkpoints/best.pt"
+            "--checkpoint-dir checkpoints"
         ),
     )
 
     ingest_archive >> bronze_to_silver >> silver_to_gold
-    silver_to_gold >> [load_warehouse, train_model]
+    silver_to_gold >> load_warehouse >> backfill_actuals
+    silver_to_gold >> train_model

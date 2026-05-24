@@ -3,8 +3,8 @@ a `seq_out`-hour temperature forecast for an arbitrary (lat, lon).
 
 Design choices:
   - Checkpoint + gold parquet are loaded once at construction; subsequent
-    `.predict()` calls reuse them. FastAPI's lifespan hook gets one
-    Predictor per app instance.
+    `.predict()` calls reuse them. Streamlit (Phase 2c) will instantiate
+    one Predictor per dashboard process.
   - Arbitrary (lat, lon) requests are snapped to the nearest grid cell we
     actually have data for (Open-Meteo answers on the ERA5 0.25° grid).
   - Features come from the gold parquet rather than being re-derived at
@@ -12,11 +12,16 @@ Design choices:
     training exactly. Cost: the lake must be re-loaded for fresh data
     (out of scope here; document that the server needs a restart, or add
     a /reload endpoint later).
+  - Predictions are persisted to Postgres for later "predicted vs. actual"
+    comparison (Phase 2b). Persistence is best-effort: a DB outage logs a
+    warning but does not fail the forecast.
 """
 
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import numpy as np
@@ -24,6 +29,13 @@ import torch
 
 from ml.dataset import WindowSpec, load_gold
 from ml.models.lstm import WeatherLSTM
+from warehouse.client import (
+    PredictionRow,
+    connect_from_env,
+    insert_predictions,
+    list_location_ids,
+    transaction,
+)
 
 
 @dataclass(frozen=True)
@@ -42,6 +54,8 @@ class ForecastResponse:
     seq_in_hours: int
     horizon_hours: int
     predictions: list[ForecastPrediction]
+    model_version: str | None = None
+    persisted: bool = False
 
 
 class NotEnoughHistory(ValueError):
@@ -54,6 +68,7 @@ class Predictor:
         checkpoint_path: Path | str,
         gold_path: Path | str,
         device: str | None = None,
+        persist: bool = True,
     ) -> None:
         self.device = torch.device(
             device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -64,6 +79,9 @@ class Predictor:
         self.feature_mean = np.asarray(ckpt["feature_mean"], dtype=np.float32)
         self.feature_std = np.asarray(ckpt["feature_std"], dtype=np.float32)
         hp = ckpt["hyperparams"]
+        # Phase 2b: checkpoints record the version they were saved under so
+        # persisted predictions can be traced back to the exact model.
+        self.model_version: str | None = ckpt.get("model_version")
 
         self.model = WeatherLSTM(
             n_features=len(self.feature_columns),
@@ -78,6 +96,25 @@ class Predictor:
         self._grid = (
             self.gold[["lat", "lon"]].drop_duplicates().to_numpy(dtype=np.float64)
         )
+
+        # Build the (lat, lon) → location_id lookup from dim_location. If the
+        # warehouse is unreachable, fall through to non-persisting mode.
+        self.persist = persist
+        self._location_ids: dict[tuple[float, float], int] = {}
+        if persist:
+            try:
+                conn = connect_from_env()
+                try:
+                    self._location_ids = list_location_ids(conn)
+                finally:
+                    conn.close()
+            except Exception as exc:
+                print(
+                    f"[predictor] warehouse unreachable; predictions will not be "
+                    f"persisted ({exc})",
+                    file=sys.stderr,
+                )
+                self.persist = False
 
     def grid_points(self) -> list[tuple[float, float]]:
         return [(float(lat), float(lon)) for lat, lon in self._grid]
@@ -112,16 +149,72 @@ class Predictor:
             pred = self.model(x_t).cpu().numpy().squeeze(0)
 
         anchor_ts = window["observed_at"].iloc[-1]
+        # Cast pandas Timestamp -> tz-aware datetime for Postgres TIMESTAMPTZ.
+        anchor_dt: datetime = anchor_ts.to_pydatetime()
+        if anchor_dt.tzinfo is None:
+            anchor_dt = anchor_dt.replace(tzinfo=timezone.utc)
+
+        predictions = [
+            ForecastPrediction(hours_ahead=i + 1, temperature_2m_c=float(pred[i]))
+            for i in range(self.spec.seq_out)
+        ]
+
+        persisted = self._persist(snapped_lat, snapped_lon, anchor_dt, predictions)
+
         return ForecastResponse(
             requested_lat=float(lat),
             requested_lon=float(lon),
             snapped_lat=snapped_lat,
             snapped_lon=snapped_lon,
-            forecast_anchor=str(anchor_ts),
+            forecast_anchor=anchor_dt.isoformat(),
             seq_in_hours=self.spec.seq_in,
             horizon_hours=self.spec.seq_out,
-            predictions=[
-                ForecastPrediction(hours_ahead=i + 1, temperature_2m_c=float(pred[i]))
-                for i in range(self.spec.seq_out)
-            ],
+            predictions=predictions,
+            model_version=self.model_version,
+            persisted=persisted,
         )
+
+    def _persist(
+        self,
+        snapped_lat: float,
+        snapped_lon: float,
+        anchor_dt: datetime,
+        predictions: list[ForecastPrediction],
+    ) -> bool:
+        """Best-effort insert into `predictions`. Returns True on success."""
+        if not self.persist or self.model_version is None:
+            return False
+        location_id = self._location_ids.get((snapped_lat, snapped_lon))
+        if location_id is None:
+            print(
+                f"[predictor] no dim_location row for ({snapped_lat}, {snapped_lon}); "
+                "skipping persist.",
+                file=sys.stderr,
+            )
+            return False
+        # target_time for hours_ahead=k is anchor + k hours. anchor is the
+        # last observation included in the inference window.
+        rows = [
+            PredictionRow(
+                target_time=anchor_dt + timedelta(hours=p.hours_ahead),
+                predicted_value=p.temperature_2m_c,
+            )
+            for p in predictions
+        ]
+        try:
+            conn = connect_from_env()
+            try:
+                with transaction(conn):
+                    insert_predictions(
+                        conn,
+                        model_version=self.model_version,
+                        location_id=location_id,
+                        prediction_made_at=datetime.now(timezone.utc),
+                        rows=rows,
+                    )
+            finally:
+                conn.close()
+            return True
+        except Exception as exc:
+            print(f"[predictor] persist failed: {exc}", file=sys.stderr)
+            return False
