@@ -74,11 +74,16 @@ def bronze_schema() -> StructType:
 
 
 def read_bronze(spark: SparkSession, bronze_path: str) -> DataFrame:
-    """Read bronze JSON with explicit schema + Hive partition discovery."""
+    """Read bronze JSON with explicit schema + Hive partition discovery.
+
+    The `marz=*` glob picks up the admin-1 partition added by
+    `ingestion/run_ingest._marz_partition` so silver carries the marz name
+    through to dim_location.
+    """
     return (
         spark.read.option("basePath", bronze_path)
         .schema(bronze_schema())
-        .json(f"{bronze_path}/region=*/dataset=*")
+        .json(f"{bronze_path}/region=*/dataset=*/marz=*")
     )
 
 
@@ -91,6 +96,7 @@ def to_silver(df: DataFrame) -> DataFrame:
     exploded = df.select(
         F.col("region"),
         F.col("dataset"),
+        F.col("marz"),
         F.col("latitude").alias("lat"),
         F.col("longitude").alias("lon"),
         F.col("elevation"),
@@ -99,6 +105,7 @@ def to_silver(df: DataFrame) -> DataFrame:
     silver = exploded.select(
         F.col("region"),
         F.col("dataset"),
+        F.col("marz"),
         F.col("lat"),
         F.col("lon"),
         F.col("elevation"),
@@ -108,7 +115,9 @@ def to_silver(df: DataFrame) -> DataFrame:
 
     # Dedupe: forecast files for the same hour overwrite as newer arrives;
     # archive files don't usually overlap but it's cheap insurance.
-    return silver.dropDuplicates(["region", "dataset", "lat", "lon", "observed_at"])
+    return silver.dropDuplicates(
+        ["region", "dataset", "marz", "lat", "lon", "observed_at"]
+    )
 
 
 def write_silver(df: DataFrame, silver_path: str) -> None:

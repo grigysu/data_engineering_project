@@ -39,8 +39,16 @@ def _season_expr(month_col: F.Column) -> F.Column:
 
 
 def build_dim_location_stage(silver: DataFrame) -> DataFrame:
-    """Distinct cells, no surrogate key — Postgres assigns it on insert."""
-    return silver.select("region", "lat", "lon", "elevation").distinct()
+    """Distinct cells; `region` is the marz (admin-1) name, not the country.
+
+    The marz tag rides along bronze → silver as a Hive partition column
+    (`marz=Yerevan` etc., added by ingestion/run_ingest._marz_partition),
+    and lands here as silver.marz. That's the same string the dashboard's
+    GeoJSON uses for `feature.properties.name`, so the choropleth join works.
+    """
+    return silver.select(
+        F.col("marz").alias("region"), "lat", "lon", "elevation"
+    ).distinct()
 
 
 def build_dim_time_stage(silver: DataFrame) -> DataFrame:
@@ -62,9 +70,18 @@ def build_fact(
     dim_location_persisted: DataFrame,
     dim_time_persisted: DataFrame,
 ) -> DataFrame:
-    """Join silver against the persisted dims to pick up IDENTITY-assigned IDs."""
+    """Join silver against the persisted dims to pick up IDENTITY-assigned IDs.
+
+    silver.marz matches dim_location.region (the marz tag rides through
+    the bronze/silver Hive partition; the warehouse stores it under the
+    legacy column name `region`). Silver also carries the country-level
+    `region` partition (= "armenia") — we drop it before renaming so the
+    join key is unambiguous (otherwise both columns survive under the
+    same name and Spark silently picks the wrong one → 0 fact rows).
+    """
+    silver_for_join = silver.drop("region").withColumnRenamed("marz", "region")
     return (
-        silver.join(
+        silver_for_join.join(
             dim_location_persisted.select("location_id", "region", "lat", "lon"),
             on=["region", "lat", "lon"],
             how="inner",

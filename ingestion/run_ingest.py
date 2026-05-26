@@ -48,16 +48,26 @@ class IngestStats:
     skipped_chunks: int = 0
 
 
+def _marz_partition(point: GridPoint) -> str:
+    """`marz=Yerevan` or `marz=unknown` if the point isn't tagged.
+
+    The marz partition lets Spark carry the admin-1 name from ingest all
+    the way into `dim_location.region`, so the dashboard's choropleth can
+    join its GeoJSON polygons to the warehouse by region name.
+    """
+    return f"marz={point.name or 'unknown'}"
+
+
 def _archive_key(region: str, year: int, point: GridPoint) -> str:
     return (
-        f"bronze/region={region}/dataset=archive/year={year}"
-        f"/lat={point.lat:.4f}_lon={point.lon:.4f}.json"
+        f"bronze/region={region}/dataset=archive/{_marz_partition(point)}"
+        f"/year={year}/lat={point.lat:.4f}_lon={point.lon:.4f}.json"
     )
 
 
 def _forecast_key(region: str, ts: datetime, point: GridPoint) -> str:
     return (
-        f"bronze/region={region}/dataset=forecast"
+        f"bronze/region={region}/dataset=forecast/{_marz_partition(point)}"
         f"/run_ts={ts.strftime('%Y%m%dT%H%M%SZ')}"
         f"/lat={point.lat:.4f}_lon={point.lon:.4f}.json"
     )

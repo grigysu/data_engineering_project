@@ -140,12 +140,17 @@ with DAG(
 
     # Retrain the LSTM against the freshly-rebuilt gold table.
     # Reads gold straight from MinIO via the s3:// path support in ml.dataset.
+    # seq_in=48h context → seq_out=24h forecast: gives the dashboard a full
+    # day of predicted values per cell. Longer horizons are noisier than 6h
+    # but the dashboard's prediction slider tops out at 24, so this is the
+    # ceiling the UI promises.
     train_model = BashOperator(
         task_id="train_model",
         bash_command=(
             f"cd {PROJECT_DIR} && "
             f"{S3_ENV} {WAREHOUSE_ENV} python -m ml.train "
             "--gold s3://weather-lake/gold/weather_features "
+            "--seq-in 48 --seq-out 24 "
             "--epochs 20 --batch-size 16 "
             "--checkpoint-dir checkpoints"
         ),

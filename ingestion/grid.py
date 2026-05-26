@@ -1,72 +1,52 @@
-"""Lat/lon grid generation for the configured region."""
+"""Grid of points to ingest, loaded from a curated locations file.
+
+Previously a uniform 10×10 bbox sweep; now one point per Armenian admin-1
+unit (10 marzes + Yerevan city), each anchored at the marz capital city.
+Coordinates come from Open-Meteo's geocoding API and are materialized to
+`ingestion/locations.json` by `ingestion/seed_locations.py`.
+"""
 
 from __future__ import annotations
 
-import os
+import json
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Iterator
-
-from dotenv import load_dotenv
-
-load_dotenv()
 
 
 @dataclass(frozen=True)
 class GridPoint:
     lat: float
     lon: float
+    name: str | None = None  # marz name, e.g. "Yerevan", "Shirak". Optional.
 
     @property
     def cell_id(self) -> str:
         return f"lat={self.lat:.4f}/lon={self.lon:.4f}"
 
 
-@dataclass(frozen=True)
-class BoundingBox:
-    lat_min: float
-    lat_max: float
-    lon_min: float
-    lon_max: float
-
-    def __post_init__(self) -> None:
-        assert self.lat_min < self.lat_max, "lat_min must be < lat_max"
-        assert self.lon_min < self.lon_max, "lon_min must be < lon_max"
+LOCATIONS_FILE = Path(__file__).parent / "locations.json"
 
 
-# Default: Armenia. Override via env vars (see .env.example).
-ARMENIA = BoundingBox(lat_min=38.84, lat_max=41.30, lon_min=43.45, lon_max=46.63)
+def load_locations(path: Path = LOCATIONS_FILE) -> list[GridPoint]:
+    """Read `locations.json` and return one GridPoint per entry.
 
-
-def load_bbox_from_env() -> BoundingBox:
-    return BoundingBox(
-        lat_min=float(os.getenv("GRID_LAT_MIN", ARMENIA.lat_min)),
-        lat_max=float(os.getenv("GRID_LAT_MAX", ARMENIA.lat_max)),
-        lon_min=float(os.getenv("GRID_LON_MIN", ARMENIA.lon_min)),
-        lon_max=float(os.getenv("GRID_LON_MAX", ARMENIA.lon_max)),
-    )
-
-
-def make_grid(bbox: BoundingBox, size: int) -> list[GridPoint]:
-    """Return a size x size evenly-spaced grid covering bbox (inclusive of corners)."""
-    assert size >= 2, "grid size must be >= 2 (need at least the corner points)"
-    lat_step = (bbox.lat_max - bbox.lat_min) / (size - 1)
-    lon_step = (bbox.lon_max - bbox.lon_min) / (size - 1)
-    points: list[GridPoint] = []
-    for i in range(size):
-        for j in range(size):
-            points.append(
-                GridPoint(
-                    lat=round(bbox.lat_min + i * lat_step, 4),
-                    lon=round(bbox.lon_min + j * lon_step, 4),
-                )
-            )
-    return points
+    The file is produced by `python -m ingestion.seed_locations`. Each entry
+    has at least `region` (marz name), `lat`, `lon`.
+    """
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    return [
+        GridPoint(
+            lat=float(entry["lat"]),
+            lon=float(entry["lon"]),
+            name=entry["region"],
+        )
+        for entry in payload
+    ]
 
 
 def default_grid() -> list[GridPoint]:
-    bbox = load_bbox_from_env()
-    size = int(os.getenv("GRID_SIZE", "10"))
-    return make_grid(bbox, size)
+    return load_locations()
 
 
 def iter_chunks(points: list[GridPoint], chunk_size: int) -> Iterator[list[GridPoint]]:
@@ -77,7 +57,6 @@ def iter_chunks(points: list[GridPoint], chunk_size: int) -> Iterator[list[GridP
 
 if __name__ == "__main__":
     grid = default_grid()
-    print(f"{len(grid)} points covering {os.getenv('REGION_NAME', 'armenia')}:")
-    for p in grid[:5]:
-        print(f"  {p.cell_id}")
-    print("  ...")
+    print(f"{len(grid)} points:")
+    for p in grid:
+        print(f"  {p.name:>14s}  {p.cell_id}")

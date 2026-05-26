@@ -2,28 +2,37 @@
 
 from __future__ import annotations
 
+import json
 from datetime import date
+from pathlib import Path
 
 
-from ingestion.grid import ARMENIA, BoundingBox, make_grid
-from ingestion.run_ingest import _archive_key, _chunk_has_missing, _year_chunks
+from ingestion.grid import GridPoint, load_locations
+from ingestion.run_ingest import (
+    _archive_key,
+    _chunk_has_missing,
+    _forecast_key,
+    _year_chunks,
+)
 from ingestion.schemas import HOURLY_VARIABLE_NAMES, OpenMeteoResponse
 
 
-def test_grid_count_and_corners():
-    grid = make_grid(ARMENIA, size=10)
-    assert len(grid) == 100
-    corners = {(p.lat, p.lon) for p in grid}
-    assert (round(ARMENIA.lat_min, 4), round(ARMENIA.lon_min, 4)) in corners
-    assert (round(ARMENIA.lat_max, 4), round(ARMENIA.lon_max, 4)) in corners
+def test_load_locations_returns_one_grid_point_per_entry(tmp_path: Path):
+    payload = [
+        {"region": "Yerevan", "lat": 40.1776, "lon": 44.5126, "capital": "Yerevan"},
+        {"region": "Shirak", "lat": 40.7931, "lon": 43.8464, "capital": "Gyumri"},
+    ]
+    f = tmp_path / "locations.json"
+    f.write_text(json.dumps(payload), encoding="utf-8")
+    pts = load_locations(f)
+    assert len(pts) == 2
+    assert pts[0].name == "Yerevan" and pts[0].lat == 40.1776
+    assert pts[1].name == "Shirak" and pts[1].lon == 43.8464
 
 
-def test_grid_size_two_returns_corners_only():
-    bbox = BoundingBox(lat_min=0.0, lat_max=1.0, lon_min=0.0, lon_max=2.0)
-    grid = make_grid(bbox, size=2)
-    assert len(grid) == 4
-    coords = {(p.lat, p.lon) for p in grid}
-    assert coords == {(0.0, 0.0), (0.0, 2.0), (1.0, 0.0), (1.0, 2.0)}
+def test_grid_point_cell_id_format():
+    p = GridPoint(lat=40.07, lon=44.5, name="Yerevan")
+    assert p.cell_id == "lat=40.0700/lon=44.5000"
 
 
 def test_year_chunks_splits_on_calendar_boundary():
@@ -41,13 +50,27 @@ def test_year_chunks_single_year():
 
 
 def test_archive_key_layout():
-    from ingestion.grid import GridPoint
-
-    key = _archive_key("armenia", 2024, GridPoint(lat=40.0700, lon=44.5000))
-    assert (
-        key
-        == "bronze/region=armenia/dataset=archive/year=2024/lat=40.0700_lon=44.5000.json"
+    key = _archive_key(
+        "armenia", 2024, GridPoint(lat=40.0700, lon=44.5000, name="Yerevan")
     )
+    assert key == (
+        "bronze/region=armenia/dataset=archive/marz=Yerevan"
+        "/year=2024/lat=40.0700_lon=44.5000.json"
+    )
+
+
+def test_archive_key_handles_unnamed_point():
+    key = _archive_key("armenia", 2024, GridPoint(lat=40.0700, lon=44.5000))
+    assert "/marz=unknown/" in key
+
+
+def test_forecast_key_includes_marz_partition():
+    from datetime import datetime, timezone
+
+    ts = datetime(2026, 5, 25, 12, 0, tzinfo=timezone.utc)
+    key = _forecast_key("armenia", ts, GridPoint(lat=40.79, lon=43.85, name="Shirak"))
+    assert "/marz=Shirak/" in key
+    assert "run_ts=20260525T120000Z" in key
 
 
 def _fake_response(n_hours: int = 3) -> dict:

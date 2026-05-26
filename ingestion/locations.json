@@ -1,0 +1,101 @@
+[
+  {
+    "region": "Yerevan",
+    "capital": "Yerevan",
+    "lat": 40.1776,
+    "lon": 44.5126,
+    "elevation": 1002.0,
+    "population": 1144700,
+    "admin1": "Yerevan"
+  },
+  {
+    "region": "Aragatsotn",
+    "capital": "Ashtarak",
+    "lat": 40.2976,
+    "lon": 44.3615,
+    "elevation": 1140.0,
+    "population": 17600,
+    "admin1": "Aragatsotn"
+  },
+  {
+    "region": "Ararat",
+    "capital": "Artashat",
+    "lat": 39.9548,
+    "lon": 44.5487,
+    "elevation": 834.0,
+    "population": 22800,
+    "admin1": "Ararat"
+  },
+  {
+    "region": "Armavir",
+    "capital": "Armavir",
+    "lat": 40.1555,
+    "lon": 44.0388,
+    "elevation": 878.0,
+    "population": 29700,
+    "admin1": "Armavir"
+  },
+  {
+    "region": "Gegharkunik",
+    "capital": "Gavar",
+    "lat": 40.354,
+    "lon": 45.1239,
+    "elevation": 1953.0,
+    "population": 18900,
+    "admin1": "Gegharkunik"
+  },
+  {
+    "region": "Kotayk",
+    "capital": "Hrazdan",
+    "lat": 40.5169,
+    "lon": 44.7559,
+    "elevation": 1702.0,
+    "population": 49500,
+    "admin1": "Kotayk"
+  },
+  {
+    "region": "Lori",
+    "capital": "Vanadzor",
+    "lat": 40.8074,
+    "lon": 44.497,
+    "elevation": 1368.0,
+    "population": 78100,
+    "admin1": "Lori"
+  },
+  {
+    "region": "Shirak",
+    "capital": "Gyumri",
+    "lat": 40.7931,
+    "lon": 43.8464,
+    "elevation": 1553.0,
+    "population": 114667,
+    "admin1": "Shirak"
+  },
+  {
+    "region": "Syunik",
+    "capital": "Kapan",
+    "lat": 39.2076,
+    "lon": 46.4068,
+    "elevation": 774.0,
+    "population": 32900,
+    "admin1": "Syunik"
+  },
+  {
+    "region": "Tavush",
+    "capital": "Ijevan",
+    "lat": 40.8804,
+    "lon": 45.1478,
+    "elevation": 755.0,
+    "population": 19500,
+    "admin1": "Tavush"
+  },
+  {
+    "region": "Vayots Dzor",
+    "capital": "Yeghegnadzor",
+    "lat": 39.7644,
+    "lon": 45.3327,
+    "elevation": 1242.0,
+    "population": 7300,
+    "admin1": "Vayots Dzor"
+  }
+]
