@@ -1,0 +1,35 @@
+# Single source of truth for ML hyperparameters.
+#
+# Loaded by `ml.config.load_config()` (typed dataclasses). The Airflow DAG,
+# the Makefile, and the CLIs all read this — no values are duplicated in
+# bash strings. CLI flags on `ml.train` / `ml.walk_forward` override these
+# at runtime (use `make show-config` to inspect the resolved config).
+
+train:
+  # Architecture
+  seq_in: 240             # hours of context fed to the LSTM
+  seq_out: 72             # hours forecast horizon
+  hidden_size: 64
+  num_layers: 2
+
+  # Optimization
+  epochs: 5
+  batch_size: 16
+  learning_rate: 0.001
+  val_fraction: 0.2       # inner split for early-stopping; honest holdout is `backtest.lookback_days`
+  seed: 42
+
+  # Honest-holdout: trim the most recent N days off the training set so
+  # walk-forward backtest anchors in [T-N .. T] have actuals to score against
+  # AND the rightmost anchor (T) is the operational forecast.
+  cutoff_days: 7
+
+backtest:
+  # Anchor range covered by the daily DAG's `walk_forward` task.
+  # Stride 24 → one anchor per day → exactly `lookback_days` anchors per cell.
+  lookback_days: 7
+  stride_hours: 24
+
+paths:
+  gold: "s3://weather-lake/gold/weather_features"
+  checkpoint_dir: "checkpoints"

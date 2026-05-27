@@ -24,8 +24,9 @@ If you read only one section of any doc, read the [big picture](docs/PROGRESS.md
                 ┌────────────────────────────────────────────────────────┐
                 │                    Airflow DAG (:8081)                 │
                 │  ingest_archive → bronze → silver → gold → warehouse   │
-                │                              ↘ backfill_actuals        │
-                │                              ↘ train_model             │
+                │                              ↘ train_model →           │
+                │                              ↘ walk_forward →          │
+                │                                backfill_actuals        │
                 └────────────────────────────────────────────────────────┘
                                        │
    ┌───────────┐    ┌─────────────┐    │    ┌──────────────┐       ┌──────────────┐
@@ -67,6 +68,7 @@ If you read only one section of any doc, read the [big picture](docs/PROGRESS.md
 | **2b** | Prediction persistence + model registry + continue-training (`--resume`) | ✅ |
 | **2c** | Streamlit unified control plane; FastAPI removed | ✅ |
 | **2d** | Adminer + docs refresh + end-to-end verification | ✅ |
+| **2e** | Walk-forward training: honest 7-day holdout + per-day backtest groups | ✅ |
 
 ## Quickstart (≈ 5 minutes once Docker is warm)
 

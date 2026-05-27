@@ -111,13 +111,13 @@ For PyArrow's S3FileSystem (used by `ml.dataset.load_gold` for `s3://` paths) an
 | `GRID_LON_MAX` | `46.63` |
 | `GRID_SIZE` | `10` (→ 10×10 = 100 points) |
 
-### Ingestion / predictor / dashboard
+### Ingestion / dashboard
 
 | Var | Default | Used by |
 |---|---|---|
 | `INGEST_CONCURRENCY` | `5` | `ingestion.run_ingest` |
-| `MODEL_CHECKPOINT` | `checkpoints/best.pt` | predictor + dashboard |
-| `GOLD_PATH` | `s3://weather-lake/gold/weather_features` | predictor + dashboard |
+| `MODEL_CHECKPOINT` | `checkpoints/best.pt` | dashboard (checkpoint meta) + `ml.walk_forward` (default `--checkpoint`) |
+| `GOLD_PATH` | `s3://weather-lake/gold/weather_features` | dashboard + `ml.walk_forward` (default `--gold`) |
 | `CHECKPOINT_DIR` | `checkpoints` | dashboard (loss-curve discovery) |
 | `WEATHER_DAG_ID` | `weather_pipeline` | dashboard |
 | `AIRFLOW_BASE_URL` | `http://localhost:8081` | dashboard → Airflow REST API |
@@ -131,7 +131,7 @@ All three live in the single `weather_postgres` container.
 
 | DB | Owner | Purpose | Initialized by |
 |---|---|---|---|
-| `weather_dw` | `weather` | Star schema (`fact_weather_observations`, `dim_location`, `dim_time`) + Phase 2b tables (`predictions`, `models`) | DDL in [warehouse/ddl/](../warehouse/ddl/), run by hand |
+| `weather_dw` | `weather` | Star schema (`fact_weather_observations`, `dim_location`, `dim_time`) + `predictions` (Phase 2b) + `backtest_groups` (Phase 2e). No model-registry table — model identity lives in the checkpoint dict. | DDL in [warehouse/ddl/](../warehouse/ddl/), run by hand |
 | `metastore_db` | `hive` | Hive Metastore's metadata (table defs, partitions) | `hive_init` runs `schematool -initOrUpgradeSchema` |
 | `airflow_db` | `airflow` | Airflow metadata (DAG runs, task instances, users) | `airflow_init` runs `airflow db migrate` |
 
@@ -197,37 +197,38 @@ data_engine/
 │   ├── silver_to_gold.py           time + lag + rolling features
 │   └── load_to_warehouse.py        Star schema load via JDBC
 │
+├── config/
+│   └── train.yaml                  ML hyperparameter config (Phase 2e single source of truth)
+│
 ├── warehouse/
 │   ├── ddl/                        Postgres DDL (numbered, run by hand)
 │   │   ├── 001_dim_location.sql
 │   │   ├── 002_dim_time.sql
 │   │   ├── 003_fact_weather_observations.sql
-│   │   ├── 004_predictions.sql        (Phase 2b)
-│   │   └── 005_models.sql             (Phase 2b)
-│   ├── client.py                   psycopg2 helpers (predictions + model registry)
+│   │   ├── 004_predictions.sql           (Phase 2b)
+│   │   └── 005_backtest_groups.sql       (Phase 2e — per-anchor MSE table)
+│   ├── client.py                   psycopg2 helpers (predictions; no Postgres model registry)
 │   ├── actuals_backfill.py         CLI: fill predictions.actual_value
+│   ├── backtest_groups.py          UPSERT per-group MSE (matches walkforward:%)
 │   └── hive/
 │       └── create_external_tables.sql  Spark SQL DDL for silver+gold
 │
 ├── ml/
+│   ├── config.py                   Typed loader for config/train.yaml (Phase 2e)
 │   ├── dataset.py                  load_gold (s3://) + WindowSpec + windowing
 │   ├── models/lstm.py              Multivariate LSTM
-│   ├── train.py                    CLI: train + versioned checkpoints + --resume
-│   ├── evaluate.py                 CLI: backtest + per-horizon metrics
+│   ├── train.py                    CLI: train + versioned checkpoints + --cutoff-days + --resume
+│   ├── walk_forward.py             CLI: daily DAG task — operational forecast + walk-forward eval
+│   ├── evaluate.py                 CLI: per-horizon metrics + plots
 │   └── logging_utils.py            setup_logger + plot helpers
 │
-├── serving/
-│   └── predictor.py                Predictor class (load + snap + predict + persist)
-│
 ├── dashboard/                      Streamlit control plane (Phase 2c)
-│   ├── app.py                      Entry — `streamlit run dashboard/app.py`
-│   ├── state.py                    Cached predictor / coverage / models / SQL
-│   ├── airflow_api.py              Thin REST wrapper for DAG triggers
-│   └── pages/                      Status, Data, Train, Predict, Browse
+│   ├── app.py                      Single-page entry — `streamlit run dashboard/app.py`
+│   └── state.py                    Cached checkpoint meta + SQL helpers
 │
 ├── airflow/
 │   └── dags/weather_pipeline.py    @daily DAG: ingest → bronze/silver/gold →
-│                                   warehouse → backfill_actuals → train_model
+│                                   warehouse → train_model → walk_forward → backfill_actuals
 │
 ├── docker/                         Compose-related extras
 │   ├── airflow/Dockerfile          Custom Airflow image (+ docker CLI + our deps)
@@ -338,20 +339,16 @@ Loader runs in **full-refresh mode**: single `TRUNCATE fact_weather_observations
 
 ## Dashboard reference
 
-Streamlit at http://localhost:8501. Five pages:
+Streamlit at http://localhost:8501. **Single-page app** (Phase 2d collapsed the original multi-page layout): [dashboard/app.py](../dashboard/app.py) renders the region picker, snapshot combobox, backtest-groups table, predictions chart (snapshot overlays + backtest overlays), and a map view in one scroll.
 
-| Page | Module | What it does |
-|---|---|---|
-| Home | [dashboard/app.py](../dashboard/app.py) | 3-column summary: coverage, current model + stale-data warning, quickstart text |
-| Status | [pages/1_Status.py](../dashboard/pages/1_Status.py) | Coverage, model registry table, recent Airflow runs |
-| Data | [pages/2_Data.py](../dashboard/pages/2_Data.py) | Date-range picker → triggers `weather_pipeline` with `conf={start_date, end_date, force}` |
-| Train | [pages/3_Train.py](../dashboard/pages/3_Train.py) | Versioned-checkpoint table + Plotly loss curves + "Train fresh" button |
-| Predict | [pages/4_Predict.py](../dashboard/pages/4_Predict.py) | Forecast for a grid cell (persisted) + history tab with predicted-vs-actual overlay |
-| Browse | [pages/5_Browse.py](../dashboard/pages/5_Browse.py) | Pre-canned SQL summaries + link to Adminer |
+Two surfaces let you put forecasts on the chart:
 
-The dashboard imports `serving.predictor.Predictor` directly (no HTTP) — `@st.cache_resource` keeps it loaded across reruns. Postgres + MinIO access is cached with short TTLs; the sidebar's "Refresh caches" button forces a re-read.
+- **Snapshot combobox** — DAG snapshots ordered DESC by `prediction_made_at`. `ml.walk_forward` writes ~8 anchors per day (`lookback_days=7`, `stride_hours=24`), so the LIMIT-50 query shows ~6 days of operational forecasts. No model_version filter — walk_forward is the only writer of predictions.
+- **Backtest-groups table** — per `(location, anchor)` best-MSE rows from [warehouse/backtest_groups.py](../warehouse/backtest_groups.py)'s UPSERT (matches `walkforward:%`). LIMIT 200 globally, sorted by MSE ASC. Check a row to add its forecast to the chart.
 
-Phase 2b added prediction persistence: every `/forecast` call writes `seq_out` rows to `weather_dw.predictions` (idempotent on `UNIQUE(model_version, location_id, prediction_made_at, target_time)`). Once observations land, the Airflow `backfill_actuals` task fills in `actual_value`.
+Caching: `dashboard/state.py` wraps Postgres reads and checkpoint-meta loads in `@st.cache_data`. The chart picks up new rows on the next Streamlit auto-rerun (TTL ~10s for SQL queries, ~60s for the checkpoint file).
+
+Phase 2b added prediction persistence: predictions are idempotent on `UNIQUE(model_version, location_id, prediction_made_at, target_time)`. Phase 2e tags daily-DAG predictions as `walkforward:<orig_checkpoint_version>` so re-running the same checkpoint is a no-op.
 
 ## Airflow DAG reference
 
@@ -366,13 +363,13 @@ Phase 2b added prediction persistence: every `/forecast` call writes `seq_out` r
 | `max_active_runs` | `1` |
 | Default `retries` | `1` |
 | Default `retry_delay` | `2 min` |
-| Per-task `execution_timeout` | `30 min` |
+| Default `execution_timeout` | `30 min` (overridden to `1 hr` on `walk_forward`) |
 
-Task graph (Phase 2a/2b):
+Task graph (Phase 2e):
 
 ```
-ingest_archive → bronze_to_silver → silver_to_gold ┬→ load_warehouse → backfill_actuals
-                                                   └→ train_model
+ingest_archive → bronze_to_silver → silver_to_gold ┬→ load_warehouse ─┐
+                                                   └→ train_model ────┴→ walk_forward → backfill_actuals
 ```
 
 | Task | Operator | Runs in | Command (simplified) |
@@ -381,8 +378,9 @@ ingest_archive → bronze_to_silver → silver_to_gold ┬→ load_warehouse →
 | `bronze_to_silver` | BashOperator | spark-master (via docker exec) | `spark-submit /opt/jobs/bronze_to_silver.py` |
 | `silver_to_gold` | BashOperator | spark-master | `spark-submit /opt/jobs/silver_to_gold.py` |
 | `load_warehouse` | BashOperator | spark-master | `spark-submit /opt/jobs/load_to_warehouse.py` |
-| `backfill_actuals` | BashOperator | airflow container | `python -m warehouse.actuals_backfill` |
-| `train_model` | BashOperator | airflow container | `python -m ml.train --gold s3://weather-lake/gold/weather_features --epochs 20` (writes a row to `models`) |
+| `train_model` | BashOperator | airflow container | `python -m ml.train` — all hyperparams from [config/train.yaml](../config/train.yaml); trims gold to `[start, T − cutoff_days]` |
+| `walk_forward` | BashOperator | airflow container | `python -m ml.walk_forward` — same checkpoint scored over `[T − lookback_days, T]` anchors; rightmost anchor is operational forecast; refreshes `backtest_groups`. `execution_timeout=1h`. |
+| `backfill_actuals` | BashOperator | airflow container | `python -m warehouse.actuals_backfill` (catches anything else whose targets just landed) |
 
 DAG params (settable from the Streamlit Data page or from the Airflow UI's "Trigger w/ config" button):
 
@@ -414,7 +412,7 @@ pip install torch --index-url https://download.pytorch.org/whl/cu128
 python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0) if torch.cuda.is_available() else '')"
 ```
 
-The serving layer also uses CUDA automatically if available.
+`ml.walk_forward` picks up the same device automatically when run inside the GPU-built Airflow scheduler.
 
 ## Git log + commit conventions
 

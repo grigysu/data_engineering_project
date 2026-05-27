@@ -1,4 +1,4 @@
-"""Unit tests for the walk-forward backtest iteration logic — no Torch, no DB."""
+"""Unit tests for walk-forward iteration helpers — no Torch model, no DB."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from ml.backtest import (
+from ml.walk_forward import (
     _to_utc_dt,
     build_inference_batch,
     enumerate_anchors,

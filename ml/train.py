@@ -1,16 +1,23 @@
 """Train a multivariate LSTM on the windowed gold dataset.
 
 Usage:
-    # Fresh run, fixed gold range, register in the model catalog:
-    python -m ml.train --gold s3://weather-lake/gold/weather_features
+    # Fresh run, hyperparams from config/train.yaml:
+    python -m ml.train
+
+    # Override individual hyperparams (anything not given uses the YAML value):
+    python -m ml.train --epochs 5 --lr 5e-4
 
     # Continue from a previous checkpoint for N more epochs:
-    python -m ml.train --gold s3://weather-lake/gold/weather_features \\
-        --resume checkpoints/best.pt --extra-epochs 5
+    python -m ml.train --resume checkpoints/best.pt --extra-epochs 5
 
 Reads gold parquet directly from MinIO via pyarrow's S3FileSystem (Phase
 2a dropped the local-FS path). Set S3_ENDPOINT / S3_ACCESS_KEY /
 S3_SECRET_KEY in `.env` to point at your MinIO instance.
+
+Honest-holdout: `train.cutoff_days` (default 7) trims the most recent N
+days off the training set so the daily `ml.walk_forward` task has actuals
+to score against. Pass `--cutoff-days 0` to train on all gold (single-shot
+mode; useful for ad-hoc experiments).
 
 Train/val split is time-based (no leakage). Checkpoints land in
 `checkpoints/<ISO_timestamp>.pt` and are also copied to
@@ -29,9 +36,11 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import torch
 from torch.utils.data import DataLoader
 
+from ml.config import load_config
 from ml.dataset import (
     FEATURE_COLUMNS,
     WeatherWindowsDataset,
@@ -123,21 +132,48 @@ def validate_resume_checkpoint(
     )
 
 
+def trim_to_cutoff(gold: pd.DataFrame, cutoff_days: int) -> pd.DataFrame:
+    """Keep only rows with observed_at <= max(observed_at) - cutoff_days.
+
+    Reserves the most recent `cutoff_days` for an honest walk-forward holdout.
+    `cutoff_days=0` is a no-op (single-shot training on all gold).
+    """
+    if cutoff_days <= 0 or gold.empty:
+        return gold
+    t_max = gold["observed_at"].max()
+    cutoff = t_max - pd.Timedelta(days=cutoff_days)
+    return gold[gold["observed_at"] <= cutoff].reset_index(drop=True)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train weather LSTM on gold parquet.")
-    parser.add_argument("--gold", required=True, help="s3:// URI of the gold parquet.")
-    parser.add_argument("--seq-in", type=int, default=24)
-    parser.add_argument("--seq-out", type=int, default=6)
-    parser.add_argument("--batch-size", type=int, default=32)
-    parser.add_argument("--epochs", type=int, default=20)
-    parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--hidden", type=int, default=64)
-    parser.add_argument("--layers", type=int, default=2)
-    parser.add_argument("--val-fraction", type=float, default=0.2)
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        help="Path to YAML config (default: config/train.yaml).",
+    )
+    # All hyperparam flags default to None — sentinel for 'use the YAML value'.
+    parser.add_argument("--gold", default=None, help="s3:// URI of the gold parquet.")
+    parser.add_argument("--seq-in", type=int, default=None)
+    parser.add_argument("--seq-out", type=int, default=None)
+    parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--epochs", type=int, default=None)
+    parser.add_argument("--lr", type=float, default=None)
+    parser.add_argument("--hidden", type=int, default=None)
+    parser.add_argument("--layers", type=int, default=None)
+    parser.add_argument("--val-fraction", type=float, default=None)
+    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument(
+        "--cutoff-days",
+        type=int,
+        default=None,
+        help="Reserve the last N days of gold as walk-forward holdout. "
+        "0 = train on all gold (single-shot mode). Default: from YAML.",
+    )
     parser.add_argument(
         "--checkpoint-dir",
-        default="checkpoints",
+        default=None,
         help="Where versioned checkpoints land. `best.pt` inside this dir is a "
         "copy of whichever run had the lowest val MSE.",
     )
@@ -156,11 +192,33 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
+    cfg = load_config(args.config)
+    t = cfg.train
+    # Resolve every hyperparam: CLI flag wins; else YAML.
+    gold_path = args.gold if args.gold is not None else cfg.paths.gold
+    seq_in = args.seq_in if args.seq_in is not None else t.seq_in
+    seq_out = args.seq_out if args.seq_out is not None else t.seq_out
+    batch_size = args.batch_size if args.batch_size is not None else t.batch_size
+    epochs = args.epochs if args.epochs is not None else t.epochs
+    lr = args.lr if args.lr is not None else t.learning_rate
+    hidden = args.hidden if args.hidden is not None else t.hidden_size
+    layers = args.layers if args.layers is not None else t.num_layers
+    val_fraction = (
+        args.val_fraction if args.val_fraction is not None else t.val_fraction
+    )
+    seed = args.seed if args.seed is not None else t.seed
+    cutoff_days = args.cutoff_days if args.cutoff_days is not None else t.cutoff_days
+    ckpt_dir_path = (
+        args.checkpoint_dir
+        if args.checkpoint_dir is not None
+        else cfg.paths.checkpoint_dir
+    )
+
+    torch.manual_seed(seed)
+    np.random.seed(seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    ckpt_dir = Path(args.checkpoint_dir)
+    ckpt_dir = Path(ckpt_dir_path)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     log = setup_logger("train", ckpt_dir / "train.log")
 
@@ -168,16 +226,30 @@ def main() -> None:
     versioned_path = ckpt_dir / f"{model_version}.pt"
     best_path = ckpt_dir / "best.pt"
 
-    log.info(f"device={device}  loading gold from {args.gold}")
+    log.info(f"device={device}  loading gold from {gold_path}")
     if device.type == "cuda":
         log.info(
             f"cuda: {torch.cuda.get_device_name(0)} "
             f"(capability {torch.cuda.get_device_capability(0)}, "
             f"torch={torch.__version__}, cuda_runtime={torch.version.cuda})"
         )
-    gold = load_gold(args.gold)
+    gold = load_gold(gold_path)
     n_locations = gold.groupby(["lat", "lon"]).ngroups
     log.info(f"{len(gold):,} gold rows; {n_locations} unique locations")
+
+    # Honest-holdout trim: keep only [start, T - cutoff_days].
+    if cutoff_days > 0:
+        before = len(gold)
+        gold = trim_to_cutoff(gold, cutoff_days)
+        log.info(
+            f"cutoff_days={cutoff_days}: trimmed {before - len(gold):,} rows "
+            f"({len(gold):,} remain for training)"
+        )
+        if gold.empty:
+            raise SystemExit(
+                f"[train] cutoff_days={cutoff_days} trimmed all rows; "
+                "either ingest more gold or reduce cutoff_days."
+            )
 
     # Provenance: what date range did we train on?
     observed_at = gold["observed_at"]
@@ -188,14 +260,14 @@ def main() -> None:
         data_range_end = observed_at.max().date()
         log.info(f"gold range: {data_range_start} .. {data_range_end}")
 
-    spec = WindowSpec(seq_in=args.seq_in, seq_out=args.seq_out)
+    spec = WindowSpec(seq_in=seq_in, seq_out=seq_out)
     X, y, anchors = build_window_set(gold, spec)
     if len(X) == 0:
         raise SystemExit(
             "[train] zero windows produced — not enough rows per location for "
-            f"seq_in={args.seq_in}+seq_out={args.seq_out}. Need more gold data."
+            f"seq_in={seq_in}+seq_out={seq_out}. Need more gold data."
         )
-    Xtr, ytr, Xva, yva = time_based_split(X, y, anchors, val_fraction=args.val_fraction)
+    Xtr, ytr, Xva, yva = time_based_split(X, y, anchors, val_fraction=val_fraction)
     log.info(f"windows: train={len(Xtr)}  val={len(Xva)}")
     if len(Xva) == 0:
         raise SystemExit(
@@ -207,8 +279,8 @@ def main() -> None:
         Xva, yva, train_ds.feature_mean, train_ds.feature_std
     )
 
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True)
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False)
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
 
     # Optional resume: load state, sanity-check schema, override start_epoch.
     start_epoch = 1
@@ -220,7 +292,7 @@ def main() -> None:
             raise SystemExit(f"[train] --resume path not found: {resume_path}")
         prev = torch.load(resume_path, map_location=device, weights_only=False)
         start_epoch, best_val = validate_resume_checkpoint(
-            prev, FEATURE_COLUMNS, args.hidden, args.layers
+            prev, FEATURE_COLUMNS, hidden, layers
         )
         resumed_from = str(resume_path)
         log.info(
@@ -230,12 +302,12 @@ def main() -> None:
 
     model = WeatherLSTM(
         n_features=len(FEATURE_COLUMNS),
-        seq_out=args.seq_out,
-        hidden_size=args.hidden,
-        num_layers=args.layers,
+        seq_out=seq_out,
+        hidden_size=hidden,
+        num_layers=layers,
     ).to(device)
     loss_fn = torch.nn.MSELoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     if args.resume:
         model.load_state_dict(prev["model_state"])
         if "optimizer_state" in prev:
@@ -244,10 +316,10 @@ def main() -> None:
     if args.resume:
         # On resume, --extra-epochs (if given) wins over --epochs; otherwise we
         # treat --epochs as "more epochs from here," not "absolute target."
-        epochs_to_run = args.extra_epochs if args.extra_epochs > 0 else args.epochs
+        epochs_to_run = args.extra_epochs if args.extra_epochs > 0 else epochs
         target_epoch = start_epoch + epochs_to_run - 1
     else:
-        target_epoch = args.epochs
+        target_epoch = epochs
 
     records: list[EpochRecord] = []
     log.info("epoch  train_mse  val_mse")
@@ -267,12 +339,13 @@ def main() -> None:
 
     trained_at = datetime.now(timezone.utc)
     hyperparams = {
-        "hidden_size": args.hidden,
-        "num_layers": args.layers,
-        "lr": args.lr,
-        "batch_size": args.batch_size,
-        "val_fraction": args.val_fraction,
-        "seed": args.seed,
+        "hidden_size": hidden,
+        "num_layers": layers,
+        "lr": lr,
+        "batch_size": batch_size,
+        "val_fraction": val_fraction,
+        "seed": seed,
+        "cutoff_days": cutoff_days,
         "resumed_from": resumed_from,
     }
     checkpoint = {

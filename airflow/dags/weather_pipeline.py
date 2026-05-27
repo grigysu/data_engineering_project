@@ -1,16 +1,16 @@
 """End-to-end weather pipeline DAG.
 
-Runs the full chain (diamond joining at `predict_all_cells`):
+Runs the full chain (diamond joining at `walk_forward`):
 
     ingest_archive → bronze_to_silver → silver_to_gold ┬→ load_warehouse ─┐
-                                                        └→ train_model ────┴→ predict_all_cells → backfill_actuals
+                                                        └→ train_model ────┴→ walk_forward → backfill_actuals
 
 Daily run: additively ingests the last 30 days of *archive* (real observations)
-from Open-Meteo, rebuilds silver/gold/warehouse (upserting dims),
-re-trains the LSTM, generates one fresh forecast per grid cell, then
-backfills actuals onto any predictions whose target_time now has an
-observation. The user never has to click anything — the dashboard is
-read-only.
+from Open-Meteo, rebuilds silver/gold/warehouse (upserting dims), re-trains
+the LSTM on gold[<= T - cutoff_days] (honest holdout), then in a single
+pass evaluates that model against `lookback_days` anchors AND produces the
+operational forecast (rightmost anchor = T, targets in the future). The
+user never has to click anything — the dashboard is read-only.
 
 Manual trigger: pass `conf={"start_date": "...", "end_date": "...", "force": false}`
 to backfill a custom range.
@@ -46,7 +46,7 @@ S3_ENV = (
 )
 
 # Postgres env for the Python tasks that touch the warehouse directly
-# (warehouse.actuals_backfill, ml.predict_all).
+# (warehouse.actuals_backfill, ml.walk_forward).
 WAREHOUSE_ENV = (
     "POSTGRES_HOST=postgres "
     "POSTGRES_PORT=5432 "
@@ -138,39 +138,36 @@ with DAG(
         bash_command=f"{SPARK_SUBMIT} /opt/jobs/load_to_warehouse.py",
     )
 
-    # Retrain the LSTM against the freshly-rebuilt gold table.
-    # Reads gold straight from MinIO via the s3:// path support in ml.dataset.
-    # seq_in=48h context → seq_out=24h forecast: gives the dashboard a full
-    # day of predicted values per cell. Longer horizons are noisier than 6h
-    # but the dashboard's prediction slider tops out at 24, so this is the
-    # ceiling the UI promises.
+    # Retrain the LSTM against the freshly-rebuilt gold table. All hyperparams
+    # live in config/train.yaml — pass nothing here so the YAML is the single
+    # source of truth. `cutoff_days` reserves the most recent days as honest
+    # holdout that walk_forward will score against.
     train_model = BashOperator(
         task_id="train_model",
         bash_command=(
-            f"cd {PROJECT_DIR} && "
-            f"{S3_ENV} {WAREHOUSE_ENV} python -m ml.train "
-            "--gold s3://weather-lake/gold/weather_features "
-            "--seq-in 48 --seq-out 24 "
-            "--epochs 20 --batch-size 16 "
-            "--checkpoint-dir checkpoints"
+            f"cd {PROJECT_DIR} && {S3_ENV} {WAREHOUSE_ENV} python -m ml.train"
         ),
     )
 
-    # Auto-generate one fresh forecast per grid cell with the new model.
-    # Needs both a trained checkpoint AND dim_location populated in Postgres.
-    predict_all_cells = BashOperator(
-        task_id="predict_all_cells",
+    # Walk-forward: in one pass evaluates the freshly-trained model against
+    # the last `lookback_days` of anchors AND produces the operational
+    # forecast (rightmost anchor = T, targets in the future). Needs both a
+    # trained checkpoint AND dim_location populated in Postgres.
+    # Bumped execution_timeout: this does inference across ~lookback_days
+    # anchors × ~100 cells; well under 30min but the default is tight.
+    walk_forward = BashOperator(
+        task_id="walk_forward",
         bash_command=(
-            f"cd {PROJECT_DIR} && "
-            f"{S3_ENV} {WAREHOUSE_ENV} python -m ml.predict_all "
-            "--checkpoint checkpoints/best.pt "
-            "--gold s3://weather-lake/gold/weather_features"
+            f"cd {PROJECT_DIR} && {S3_ENV} {WAREHOUSE_ENV} python -m ml.walk_forward"
         ),
+        execution_timeout=timedelta(hours=1),
     )
 
     # Fill predictions.actual_value where the corresponding observation
     # just landed in fact_weather_observations (runs last so it sees the
-    # freshly inserted forecasts too).
+    # freshly inserted forecasts too). walk_forward itself only backfills
+    # its own walkforward:* rows; this catches anything else (e.g. legacy
+    # rows whose targets just landed).
     backfill_actuals = BashOperator(
         task_id="backfill_actuals",
         bash_command=(
@@ -181,4 +178,4 @@ with DAG(
     ingest_archive >> bronze_to_silver >> silver_to_gold
     silver_to_gold >> load_warehouse
     silver_to_gold >> train_model
-    [load_warehouse, train_model] >> predict_all_cells >> backfill_actuals
+    [load_warehouse, train_model] >> walk_forward >> backfill_actuals

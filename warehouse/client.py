@@ -64,6 +64,7 @@ def insert_predictions(
     location_id: int,
     prediction_made_at: datetime,
     rows: Iterable[PredictionRow],
+    seq_in: int | None = None,
 ) -> int:
     """Bulk-insert one /forecast call's worth of prediction rows.
 
@@ -77,6 +78,7 @@ def insert_predictions(
             prediction_made_at,
             r.target_time,
             r.predicted_value,
+            seq_in,
         )
         for r in rows
     ]
@@ -84,8 +86,8 @@ def insert_predictions(
         return 0
     sql = (
         "INSERT INTO predictions "
-        "(model_version, location_id, prediction_made_at, target_time, predicted_value) "
-        "VALUES (%s, %s, %s, %s, %s) "
+        "(model_version, location_id, prediction_made_at, target_time, predicted_value, seq_in) "
+        "VALUES (%s, %s, %s, %s, %s, %s) "
         "ON CONFLICT (model_version, location_id, prediction_made_at, target_time) "
         "DO NOTHING"
     )

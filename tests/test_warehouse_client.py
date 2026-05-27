@@ -41,11 +41,13 @@ def test_insert_predictions_executes_bulk_insert():
         location_id=42,
         prediction_made_at=datetime(2026, 5, 24, 11, 0, tzinfo=timezone.utc),
         rows=rows,
+        seq_in=240,
     )
     assert n == 2
     cur.executemany.assert_called_once()
     sql, params = cur.executemany.call_args.args
     assert "INSERT INTO predictions" in sql
+    assert "seq_in" in sql
     assert "ON CONFLICT" in sql
     assert len(params) == 2
     assert params[0] == (
@@ -54,7 +56,28 @@ def test_insert_predictions_executes_bulk_insert():
         datetime(2026, 5, 24, 11, 0, tzinfo=timezone.utc),
         datetime(2026, 5, 24, 12, 0, tzinfo=timezone.utc),
         12.5,
+        240,
     )
+
+
+def test_insert_predictions_seq_in_defaults_to_null():
+    conn, cur = _mock_conn()
+    rows = [
+        PredictionRow(
+            target_time=datetime(2026, 5, 24, 12, 0, tzinfo=timezone.utc),
+            predicted_value=12.5,
+        ),
+    ]
+    cur.rowcount = 1
+    insert_predictions(
+        conn,
+        model_version="v",
+        location_id=1,
+        prediction_made_at=datetime(2026, 5, 24, 11, 0, tzinfo=timezone.utc),
+        rows=rows,
+    )
+    _, params = cur.executemany.call_args.args
+    assert params[0][-1] is None
 
 
 def test_insert_predictions_empty_list_short_circuits():

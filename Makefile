@@ -60,11 +60,16 @@ help:
 	@echo "  DAG:"
 	@echo "    unpause / trigger             unpause + manually trigger weather_pipeline"
 	@echo "    runs                          list recent DAG runs"
-	@echo "    train                         clear + rerun train_model -> predict -> backfill"
-	@echo "    predict                       clear + rerun predict_all_cells -> backfill"
-	@echo "    backtest                      walk-forward backtest; populates older snapshots"
-	@echo "                                  (vars: STRIDE=24 START=YYYY-MM-DD END=YYYY-MM-DD)"
-	@echo "    reset-predictions             TRUNCATE predictions + rerun predict"
+	@echo "    train                         clear + rerun train_model -> walk_forward -> backfill"
+	@echo "    walk-forward                  clear + rerun walk_forward -> backfill (reuses checkpoint)"
+	@echo "    show-config                   print the resolved config/train.yaml as JSON"
+	@echo "    ingest                        trigger full DAG over a date range"
+	@echo "                                  (vars: START=YYYY-MM-DD END=YYYY-MM-DD; default = last year)"
+	@echo ""
+	@echo "  Clear (removal only — chain with walk-forward / trigger to rebuild):"
+	@echo "    clear-predictions             TRUNCATE predictions + backtest_groups"
+	@echo "    clear-checkpoints             rm -rf checkpoints/*"
+	@echo "    clear-ml                      clear-predictions + clear-checkpoints + clear Airflow ML tasks"
 	@echo ""
 	@echo "  Note: Open-Meteo archive lags ~2 days; data_range_end is normally (today - 2d)."
 	@echo ""
@@ -80,9 +85,9 @@ help:
 	@echo ""
 	@echo "  Data layer:"
 	@echo "    init-db                       apply warehouse DDL (idempotent on a clean DB)"
-	@echo "    reset-db                      drop + reapply warehouse DDL"
-	@echo "    reset-lake                    wipe MinIO bronze/silver/gold"
-	@echo "    reset                         reset-lake + reset-db (full nuke; data loss)"
+	@echo "    clear-db                      DROP TABLE … CASCADE for all warehouse tables"
+	@echo "    clear-lake                    wipe MinIO bronze/silver/gold/manifest"
+	@echo "    clear-all                     clear-lake + clear-db (full data nuke; checkpoints untouched)"
 	@echo ""
 	@echo "  GPU:"
 	@echo "    gpu-build                     rebuild airflow image with CUDA torch + recreate scheduler"
@@ -110,55 +115,55 @@ trigger: unpause
 runs:
 	docker exec $(SCHEDULER) airflow dags list-runs --dag-id $(DAG)
 
-# Clear + rerun training. Downstream (predict_all_cells, backfill_actuals)
-# get cleared too so the new checkpoint propagates into predictions.
+# Trigger the full DAG over a custom date range. Override START / END:
+#     make ingest START=2025-05-26 END=2026-05-24
+# Open-Meteo archive lags ~2 days; END should normally be (today - 2d).
+# Ingest is additive (manifest-aware), so re-running the same range is cheap.
+START ?= $(shell date -u -d '1 year ago'  +%Y-%m-%d 2>/dev/null || powershell -c "(Get-Date).AddYears(-1).ToString('yyyy-MM-dd')")
+END   ?= $(shell date -u -d '2 days ago'  +%Y-%m-%d 2>/dev/null || powershell -c "(Get-Date).AddDays(-2).ToString('yyyy-MM-dd')")
+ingest:
+	docker exec $(SCHEDULER) airflow dags trigger $(DAG) \
+		--conf '{"start_date": "$(START)", "end_date": "$(END)"}'
+
+# Clear + rerun training. Downstream (walk_forward, backfill_actuals) get
+# cleared too so the new checkpoint propagates into predictions.
 # Use when the data hasn't changed but you want a fresh model from existing gold.
 train:
 	docker exec $(SCHEDULER) airflow tasks clear $(DAG) \
-		-t "train_model|predict_all_cells|backfill_actuals" --yes
+		-t "train_model|walk_forward|backfill_actuals" --yes
 
-# Clear + rerun prediction only (reuses the existing checkpoint).
+# Clear + rerun walk-forward only (reuses the existing checkpoint).
 # Use when the checkpoint is fine but predictions are stale or missing.
-predict:
+walk-forward:
 	docker exec $(SCHEDULER) airflow tasks clear $(DAG) \
-		-t "predict_all_cells|backfill_actuals" --yes
+		-t "walk_forward|backfill_actuals" --yes
 
-# Wipe every prediction snapshot, then regenerate from the current checkpoint.
-# Safe — predictions has no inbound FKs, so TRUNCATE doesn't cascade.
-reset-predictions:
-	docker exec $(POSTGRES) psql -U weather -d weather_dw -c "TRUNCATE predictions;"
-	"$(MAKE)" predict
+# Print the resolved config (YAML + dataclass defaults) as JSON. Useful
+# when wondering 'what hyperparams will the next DAG run use?'.
+show-config:
+	$(PYTHON) -c "import json; from ml.config import load_config; \
+		print(json.dumps(load_config().to_dict(), indent=2))"
 
-# Walk-forward backtest: slide through historical gold, one prediction
-# snapshot per anchor written into the `predictions` table. Populates the
-# dashboard's "Overlay older snapshots" picker with synthetic-but-real
-# historical forecasts produced by the current checkpoint.
-#
-# STRIDE controls snapshot density (default 24 = one per day).
-#     make backtest STRIDE=6   # every 6 hours
-#     make backtest START=2026-05-01 END=2026-05-20
-STRIDE ?= 24
-backtest:
-	docker exec \
-		-e MINIO_BUCKET=weather-lake \
-		-e MINIO_ENDPOINT=http://minio:9000 \
-		-e S3_ENDPOINT=http://minio:9000 \
-		-e S3_ACCESS_KEY=minioadmin \
-		-e S3_SECRET_KEY=minioadmin \
-		-e REGION_NAME=armenia \
-		-e POSTGRES_HOST=postgres \
-		-e POSTGRES_PORT=5432 \
-		-e POSTGRES_DB=weather_dw \
-		-e POSTGRES_USER=weather \
-		-e POSTGRES_PASSWORD=weather \
-		$(SCHEDULER) bash -c \
-		"cd /opt/weather && python -m ml.backtest \
-			--checkpoint checkpoints/best.pt \
-			--gold s3://weather-lake/gold/weather_features \
-			--stride-hours $(STRIDE) \
-			$(if $(START),--start $(START)) \
-			$(if $(END),--end $(END)) \
-		 && python -m warehouse.backtest_groups"
+# ---------- Clear (removal only — chain with walk-forward / trigger to rebuild) ----------
+
+# Wipe every prediction snapshot + the derived BT-groups rows.
+# Safe — neither table has inbound FKs, so TRUNCATE doesn't cascade.
+# To repopulate: `make walk-forward` (reuses checkpoint) or `make trigger`.
+clear-predictions:
+	docker exec $(POSTGRES) psql -U weather -d weather_dw -c \
+		"TRUNCATE predictions, backtest_groups;"
+
+# Wipe every training artifact under checkpoints/. Next `make train` or
+# the DAG's train_model task starts from a clean slate.
+clear-checkpoints:
+	rm -rf checkpoints/*
+
+# Wipe ML state end-to-end: checkpoints + predictions + BT groups +
+# stale Airflow task states for the training/prediction chain. Doesn't
+# touch gold/silver/bronze.
+clear-ml: clear-predictions clear-checkpoints
+	docker exec $(SCHEDULER) airflow tasks clear $(DAG) \
+		-t "train_model|walk_forward|backfill_actuals" --yes
 
 # ---------- Quality gates ----------
 test:
@@ -183,12 +188,11 @@ seed:
 init-db:
 	cat $(DDL) | docker exec -i $(POSTGRES) psql -U weather -d weather_dw -v ON_ERROR_STOP=1
 
-reset-db:
+clear-db:
 	docker exec -i $(POSTGRES) psql -U weather -d weather_dw -c \
-		"DROP TABLE IF EXISTS predictions, fact_weather_observations, dim_time, dim_location CASCADE;"
-	"$(MAKE)" init-db
+		"DROP TABLE IF EXISTS backtest_groups, predictions, fact_weather_observations, dim_time, dim_location CASCADE;"
 
-reset-lake:
+clear-lake:
 	docker run --rm --network $(MINIO_NETWORK) --entrypoint sh minio/mc:latest -c \
 		"mc alias set local http://minio:9000 minioadmin minioadmin >/dev/null && \
 		 mc rm --recursive --force local/weather-lake/bronze/   >/dev/null 2>&1 || true && \
@@ -197,9 +201,12 @@ reset-lake:
 		 mc rm --recursive --force local/weather-lake/manifest/ >/dev/null 2>&1 || true && \
 		 echo 'lake wiped (bronze + silver + gold + manifest)'"
 
-reset: reset-lake reset-db
+# Lake + DB only. Checkpoints stay (use `clear-checkpoints` for those).
+# To repopulate: `make init-db && make trigger`.
+clear-all: clear-lake clear-db
 	@echo ""
-	@echo "Full reset done. Run 'make trigger' to repopulate."
+	@echo "Lake + DB wiped. Run 'make init-db && make trigger' to repopulate."
+	@echo "(checkpoints/ untouched — use 'make clear-checkpoints' for those.)"
 
 # ---------- Service shortcuts ----------
 psql:
@@ -293,8 +300,9 @@ verify-gpu:
 
 .PHONY: help \
         up down restart logs \
-        unpause trigger runs train predict backtest reset-predictions \
+        unpause trigger runs train walk-forward show-config ingest \
+        clear-predictions clear-checkpoints clear-ml \
         test lint format check smoke status \
-        seed init-db reset-db reset-lake reset \
+        seed init-db clear-db clear-lake clear-all \
         psql dashboard minio adminer airflow \
         gpu-build verify-gpu

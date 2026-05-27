@@ -1,4 +1,4 @@
-"""CLI: refresh `backtest_groups` with per-group MSE for completed backtests.
+"""CLI: refresh `backtest_groups` with per-group MSE for completed groups.
 
 A "group" = one (location_id, model_version, prediction_made_at) tuple in
 the `predictions` table — i.e. all `seq_out` rows for one anchor on one
@@ -8,11 +8,13 @@ UPSERT semantics make this safe to re-run; existing rows get refreshed
 `mse` + `computed_at` if more rows have since been backfilled into the
 same group.
 
-Filters to `model_version LIKE 'backtest:%'` — `ml.backtest` tags its runs
-that way, so this table is backtest-only by construction.
+Filters to `model_version LIKE 'walkforward:%'` — the daily DAG's
+`ml.walk_forward` task is the only writer of evaluable prediction sets.
+(The legacy `ml.backtest` CLI was removed; old `backtest:*` rows are
+ignored by this refresh but stay queryable in `predictions`.)
 
-Run after a backtest:
-    python -m warehouse.backtest_groups
+Imported by `ml.walk_forward` which re-uses the SQL constant to refresh
+in the same task; also runnable standalone as `python -m warehouse.backtest_groups`.
 """
 
 from __future__ import annotations
@@ -35,7 +37,7 @@ SELECT
     COUNT(*) AS n_hours,
     AVG((predicted_value - actual_value) * (predicted_value - actual_value)) AS mse
 FROM predictions
-WHERE model_version LIKE 'backtest:%%'
+WHERE model_version LIKE 'walkforward:%%'
 GROUP BY location_id, model_version, prediction_made_at
 HAVING COUNT(*) = COUNT(actual_value)
 ON CONFLICT (location_id, model_version, prediction_made_at) DO UPDATE

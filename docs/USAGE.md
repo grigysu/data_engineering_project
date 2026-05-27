@@ -199,36 +199,86 @@ ORDER  BY hottest DESC;
 
 ## Workflow 4 — train + evaluate the model
 
+Phase 2e replaced the old "train once, predict the next 24h from `now`" path with **walk-forward**: train on gold up to `T − cutoff_days`, then in one inference pass score the model against the last `lookback_days` of anchors *and* produce the operational forecast (the rightmost anchor whose targets are still in the future). The DAG runs both pieces daily; the same modules also run by hand.
+
+### Hyperparameter config — `config/train.yaml`
+
+Single source of truth. The Airflow DAG, the Makefile, and both CLIs read this; nothing is duplicated in bash strings.
+
+```yaml
+train:
+  seq_in: 48
+  seq_out: 24
+  hidden_size: 64
+  num_layers: 2
+  epochs: 5
+  batch_size: 16
+  learning_rate: 0.001
+  val_fraction: 0.2
+  seed: 42
+  cutoff_days: 7      # reserve the last N days as honest holdout
+
+backtest:
+  lookback_days: 7    # walk_forward anchors span [T - N .. T]
+  stride_hours: 24    # one anchor per day
+
+paths:
+  gold: "s3://weather-lake/gold/weather_features"
+  checkpoint_dir: "checkpoints"
+```
+
+Inspect the resolved config (YAML + dataclass defaults) at any time:
+
+```powershell
+make show-config
+```
+
+CLI flags on `ml.train` and `ml.walk_forward` override individual YAML values per-run — anything you don't pass uses the YAML.
+
 ### Train (fresh run)
 
 ```powershell
 $env:S3_ENDPOINT='http://localhost:9000'
 $env:S3_ACCESS_KEY='minioadmin'
 $env:S3_SECRET_KEY='minioadmin'
-python -m ml.train --gold s3://weather-lake/gold/weather_features --epochs 30
+python -m ml.train                          # all hyperparams from YAML
+python -m ml.train --epochs 5 --lr 5e-4     # one-off overrides
+python -m ml.train --cutoff-days 0          # single-shot: train on ALL gold
 ```
 
-Reads gold parquet directly from MinIO (no local sync). Each run records a row in the Postgres `models` table (Phase 2b) and writes versioned artifacts to `checkpoints/`:
+Reads gold parquet directly from MinIO (no local sync). `cutoff_days` trims the most recent N days off the training set so `walk_forward` has actuals to score against — pass `--cutoff-days 0` for single-shot training (useful for ad-hoc experiments where you don't need the holdout).
 
-- `<version>.pt` — versioned weights + spec + feature stats + provenance (data range, gold row count, optimizer state)
+Writes versioned artifacts to `checkpoints/`:
+
+- `<version>.pt` — weights + spec + feature stats + provenance (data range, row count, hyperparams, optimizer state)
 - `<version>.metrics.json` — summary
 - `<version>_log.csv` — per-epoch (epoch, train_mse, val_mse, is_best)
 - `<version>_loss.png` — train + val MSE chart
-- `best.pt` — copy of the latest run (used by the predictor + Streamlit)
+- `best.pt` — copy of the latest run (used by `ml.walk_forward` and the dashboard)
 - `train.log` — timestamped console output
 
-`<version>` is an ISO-8601 timestamp (Windows-safe filename, e.g. `2026-05-24T13-15-22Z`).
+`<version>` is an ISO-8601 timestamp (Windows-safe filename, e.g. `2026-05-27T13-15-22Z`). Model identity lives entirely in the checkpoint dict — there's no Postgres model-registry table.
 
 ### Continue training from a checkpoint
 
 ```powershell
-python -m ml.train --gold s3://weather-lake/gold/weather_features `
-  --resume checkpoints/best.pt --extra-epochs 5
+python -m ml.train --resume checkpoints/best.pt --extra-epochs 5
 ```
 
-Loads the previous state dict + optimizer state and continues from `epoch = checkpoint["epoch"] + 1`. Refuses to run if `feature_columns` or hidden/layers differ — schema-drift guard.
+Loads the previous state dict + optimizer state and continues from `epoch = checkpoint["epoch"] + 1`. Refuses if `feature_columns` or hidden/layers differ — schema-drift guard.
 
-### Evaluate (backtest the saved checkpoint)
+### Walk-forward (operational forecast + honest 7-day evaluation, one pass)
+
+```powershell
+python -m ml.walk_forward                    # uses checkpoints/best.pt + YAML
+python -m ml.walk_forward --lookback-days 14 --stride-hours 6
+```
+
+For each cell, enumerates anchors in `[T − lookback_days .. T]` at `stride_hours` intervals and persists `seq_out` predictions per anchor. The rightmost anchor (T) is the operational forecast — its targets extend into the future, so `actual_value` stays NULL until subsequent runs backfill from new observations. Anchors with `target_time` already in the past get filled immediately via `backfill_actuals_for_version`. Predictions land in `predictions` tagged `model_version = walkforward:<orig_checkpoint_version>` and the same task refreshes `backtest_groups` so the dashboard's BT table picks them up.
+
+Re-running with the same checkpoint is a no-op (UNIQUE constraint on `(model_version, location_id, prediction_made_at, target_time)`). A fresh training produces a new `orig_version` → fresh `walkforward:*` rows.
+
+### Evaluate (per-horizon metrics from a checkpoint)
 
 ```powershell
 python -m ml.evaluate --gold s3://weather-lake/gold/weather_features
@@ -240,24 +290,34 @@ Artifacts:
 - `per_horizon_error.png` — MAE/RMSE bars + persistence baseline
 - `predictions_vs_actual.png` — 6 sample windows truth-vs-forecast
 
-### Training CLI flags
+### CLI flags reference
 
-| Flag | Default |
+All hyperparam flags below default to the YAML value if omitted (sentinel: `None` in argparse). The YAML in turn falls back to the dataclass defaults in [ml/config.py](../ml/config.py).
+
+**`python -m ml.train`**
+
+| Flag | Source if omitted |
 |---|---|
-| `--gold PATH` | required (must be `s3://...`) |
-| `--seq-in` | 24 (hours of context) |
-| `--seq-out` | 6 (hours to predict) |
-| `--batch-size` | 32 |
-| `--epochs` | 20 |
-| `--lr` | 1e-3 |
-| `--hidden` | 64 (LSTM hidden size) |
-| `--layers` | 2 (LSTM layers) |
-| `--val-fraction` | 0.2 (time-based split) |
-| `--seed` | 42 |
-| `--checkpoint-dir` | `checkpoints` |
-| `--resume PATH` | — | Continue from a checkpoint |
-| `--extra-epochs N` | 0 | Epochs to add on top of the resume point |
-| `--no-register` | off | Skip writing a row to the Postgres `models` table |
+| `--config PATH` | `config/train.yaml` |
+| `--gold` | `paths.gold` |
+| `--seq-in`, `--seq-out` | `train.seq_in` / `train.seq_out` |
+| `--batch-size`, `--epochs`, `--lr` | corresponding `train.*` |
+| `--hidden`, `--layers` | `train.hidden_size` / `train.num_layers` |
+| `--val-fraction`, `--seed` | `train.val_fraction` / `train.seed` |
+| `--cutoff-days N` | `train.cutoff_days`; `0` = single-shot, train on all gold |
+| `--checkpoint-dir` | `paths.checkpoint_dir` |
+| `--resume PATH` | — | continue from an existing checkpoint |
+| `--extra-epochs N` | `0` | epochs to add on top of the resume point |
+
+**`python -m ml.walk_forward`**
+
+| Flag | Source if omitted |
+|---|---|
+| `--config PATH` | `config/train.yaml` |
+| `--checkpoint PATH` | `<paths.checkpoint_dir>/best.pt` |
+| `--gold` | `paths.gold` |
+| `--lookback-days N` | `backtest.lookback_days` |
+| `--stride-hours N` | `backtest.stride_hours` |
 
 ---
 
@@ -335,8 +395,26 @@ docker exec weather_airflow_scheduler airflow tasks states-for-dag-run `
   weather_pipeline manual__2026-05-24T09:15:26+00:00
 
 # Tail a task's log (paths are inside the container's /opt/airflow/logs/)
-docker exec weather_airflow_scheduler bash -c "ls /opt/airflow/logs/dag_id=weather_pipeline/run_id=*/task_id=train_model/"
+docker exec weather_airflow_scheduler bash -c "ls /opt/airflow/logs/dag_id=weather_pipeline/run_id=*/task_id=walk_forward/"
 ```
+
+### Task graph
+
+```
+ingest_archive → bronze_to_silver → silver_to_gold ┬→ load_warehouse ─┐
+                                                   └→ train_model ────┴→ walk_forward → backfill_actuals
+```
+
+| Task | What it does |
+|---|---|
+| `ingest_archive` | Additive Open-Meteo archive pull → MinIO bronze |
+| `bronze_to_silver`, `silver_to_gold` | Spark medallion ETL |
+| `load_warehouse` | Spark JDBC into Postgres star schema |
+| `train_model` | `python -m ml.train` — reads `config/train.yaml`, trims gold to `[start, T − cutoff_days]`, writes `checkpoints/best.pt` |
+| `walk_forward` | `python -m ml.walk_forward` — same model evaluated over `[T − lookback_days, T]` anchors; rightmost anchor = operational forecast; refreshes `backtest_groups` |
+| `backfill_actuals` | Fills `predictions.actual_value` for any rows whose observation has since landed (catches non-walk_forward versions too) |
+
+`walk_forward` has its `execution_timeout` bumped to 1 hour (others use the 30-min `default_args` value).
 
 ### Editing the DAG
 
@@ -358,10 +436,17 @@ ruff check .                                    # lint (auto-fix: ruff check --f
 ruff format --check .                           # format (auto-fix: ruff format .)
 pytest tests/ -q                                # tests
 python -c "import ingestion.run_ingest, ingestion.coverage, ingestion.storage, ingestion.healthcheck, `
-  ml.dataset, ml.train, ml.evaluate, ml.models.lstm, `
-  serving.predictor, warehouse.client, warehouse.actuals_backfill, `
-  dashboard.state, dashboard.airflow_api; `
+  ml.config, ml.dataset, ml.train, ml.evaluate, ml.walk_forward, ml.models.lstm, `
+  warehouse.client, warehouse.actuals_backfill, warehouse.backtest_groups, `
+  dashboard.state; `
   print('venv imports OK')"
+```
+
+Or use the Makefile shortcuts:
+
+```powershell
+make check          # ruff check + format check + pytest (mirrors the pre-commit gate)
+make show-config    # print the resolved config/train.yaml as JSON
 ```
 
 ---

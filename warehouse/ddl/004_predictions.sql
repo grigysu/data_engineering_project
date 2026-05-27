@@ -7,6 +7,8 @@
 -- TRUNCATEs dim_location + dim_time + fact_weather_observations, but NOT
 -- this table. We want prediction history to survive every warehouse rebuild.
 
+-- `seq_in` records the hours of context fed to the LSTM at inference time.
+-- Nullable so legacy rows written before the column existed remain valid.
 CREATE TABLE IF NOT EXISTS predictions (
     id                  BIGSERIAL          PRIMARY KEY,
     model_version       TEXT               NOT NULL,
@@ -16,8 +18,12 @@ CREATE TABLE IF NOT EXISTS predictions (
     predicted_value     DOUBLE PRECISION   NOT NULL,
     actual_value        DOUBLE PRECISION,
     actual_filled_at    TIMESTAMPTZ,
+    seq_in              INTEGER,
     UNIQUE (model_version, location_id, prediction_made_at, target_time)
 );
+
+-- Idempotent column add for databases created before seq_in existed.
+ALTER TABLE predictions ADD COLUMN IF NOT EXISTS seq_in INTEGER;
 
 CREATE INDEX IF NOT EXISTS idx_predictions_target_time ON predictions (target_time);
 CREATE INDEX IF NOT EXISTS idx_predictions_model_version ON predictions (model_version);
