@@ -1,4 +1,4 @@
-"""Seed `ingestion/locations.json` from Open-Meteo's geocoding API.
+"""Seed `config/locations.json` from Open-Meteo's geocoding API.
 
 For each Armenian admin-1 unit (10 marzes + Yerevan city), fetches the
 authoritative coordinates of its capital city. Output is a JSON list keyed
@@ -39,7 +39,7 @@ MARZ_CAPITALS: list[tuple[str, str]] = [
     ("Vayots Dzor", "Yeghegnadzor"),
 ]
 
-OUTPUT = Path(__file__).parent / "locations.json"
+OUTPUT = Path(__file__).resolve().parents[1] / "config" / "locations.json"
 
 
 def geocode(client: httpx.Client, name: str) -> dict:

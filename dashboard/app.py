@@ -29,7 +29,7 @@ from dashboard.state import (
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 GEOJSON_PATH = REPO_ROOT / "dashboard" / "data" / "armenia_marzes.geojson"
-LOCATIONS_JSON_PATH = REPO_ROOT / "ingestion" / "locations.json"
+LOCATIONS_JSON_PATH = REPO_ROOT / "config" / "locations.json"
 
 
 load_dotenv()

@@ -81,7 +81,7 @@ help:
 	@echo "    test / lint / format / check  quality gates (uses local venv)"
 	@echo "    smoke                         run every read-only target end-to-end (Makefile self-test)"
 	@echo "    status                        what's in MinIO + warehouse + checkpoint right now"
-	@echo "    seed                          regenerate ingestion/locations.json from Open-Meteo geocoding"
+	@echo "    seed                          regenerate config/locations.json from Open-Meteo geocoding"
 	@echo ""
 	@echo "  Data layer:"
 	@echo "    init-db                       apply warehouse DDL (idempotent on a clean DB)"

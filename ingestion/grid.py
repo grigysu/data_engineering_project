@@ -3,7 +3,7 @@
 Previously a uniform 10×10 bbox sweep; now one point per Armenian admin-1
 unit (10 marzes + Yerevan city), each anchored at the marz capital city.
 Coordinates come from Open-Meteo's geocoding API and are materialized to
-`ingestion/locations.json` by `ingestion/seed_locations.py`.
+`config/locations.json` by `ingestion/seed_locations.py`.
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ class GridPoint:
         return f"lat={self.lat:.4f}/lon={self.lon:.4f}"
 
 
-LOCATIONS_FILE = Path(__file__).parent / "locations.json"
+LOCATIONS_FILE = Path(__file__).resolve().parents[1] / "config" / "locations.json"
 
 
 def load_locations(path: Path = LOCATIONS_FILE) -> list[GridPoint]:

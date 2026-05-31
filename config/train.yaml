@@ -13,7 +13,7 @@ train:
   num_layers: 2
 
   # Optimization
-  epochs: 5
+  epochs: 3
   batch_size: 16
   learning_rate: 0.001
   val_fraction: 0.2       # inner split for early-stopping; honest holdout is `backtest.lookback_days`
